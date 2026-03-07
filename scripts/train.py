@@ -8,9 +8,10 @@ Architecture:
 
 Training:
   Sequence length T=64 (~1 sec of game time at 60fps).
-  Batch: B sequences × T frames, h/c zeroed per sequence (independent context).
-  BPTT through full T unroll.
-  Sequence-level oversampling: keep all action seqs + neutral_keep fraction of neutral seqs.
+  Batch: B TBPTT streams × T frames.
+  Contextual sampler (default): mixed targeted+natural segment sampling with
+  configurable offense/defense/transition and event ratios.
+  Legacy sampler: keep all action segments + neutral_keep fraction of neutral segments.
   Temporal split 70/15/15 by match order.
 
 Usage:
@@ -21,6 +22,7 @@ Usage:
 import argparse
 import math
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -44,6 +46,27 @@ STICK_NAMES  = ["stick_x", "stick_y", "cstick_x", "cstick_y"]
 F1_TARGETS       = {"A": 0.45, "B": 0.55, "X": 0.40, "Y": 0.35, "L": 0.30, "R": 0.50}
 STICK_ERR_TARGET = 25.0
 IDLE_ACC_TARGET  = 0.90
+
+# Contextual sampler labels
+CTX_OFFENSE    = "offense"
+CTX_DEFENSE    = "defense"
+CTX_TRANSITION = "transition"
+CTX_NAMES      = [CTX_OFFENSE, CTX_DEFENSE, CTX_TRANSITION]
+
+EVT_SHOT    = "shot"
+EVT_PASS    = "pass"
+EVT_DEF_HIT = "def_hit"
+EVT_ITEM    = "item"
+EVT_MOVE    = "move"
+EVT_NAMES   = [EVT_SHOT, EVT_PASS, EVT_DEF_HIT, EVT_ITEM, EVT_MOVE]
+
+# build_dataset.py feature index constants (430 core + 10 prev action)
+# Carrier flags in the 430-core block:
+#   self carrier: 66
+#   friendly striker carriers: 102, 138, 174
+#   enemy striker carriers: 240, 276, 312, 348
+OWN_CARRIER_IDXS   = [66, 102, 138, 174]
+ENEMY_CARRIER_IDXS = [240, 276, 312, 348]
 
 
 # --- Discretization helpers --------------------------------------------------
@@ -394,6 +417,193 @@ def oversample_segments(seg_ranges: list, y: np.ndarray,
     return combined
 
 
+def classify_segment_context(x_seg: np.ndarray) -> str:
+    """Classify a segment as offense / defense / transition from possession cues."""
+    if len(x_seg) == 0:
+        return CTX_TRANSITION
+
+    own_has_ball   = np.any(x_seg[:, OWN_CARRIER_IDXS] > 0.5, axis=1)
+    enemy_has_ball = np.any(x_seg[:, ENEMY_CARRIER_IDXS] > 0.5, axis=1)
+    own_frac       = float(own_has_ball.mean())
+    enemy_frac     = float(enemy_has_ball.mean())
+
+    if own_frac >= 0.35 and own_frac > enemy_frac + 0.05:
+        return CTX_OFFENSE
+    if enemy_frac >= 0.35 and enemy_frac > own_frac + 0.05:
+        return CTX_DEFENSE
+    return CTX_TRANSITION
+
+
+def classify_segment_event(context: str, y_seg: np.ndarray) -> str:
+    """Primary event label for one segment (used by contextual sampler)."""
+    has_a     = bool(np.any(y_seg[:, 0] > 0.5))
+    has_b     = bool(np.any(y_seg[:, 1] > 0.5))
+    has_x     = bool(np.any(y_seg[:, 2] > 0.5))
+    has_y     = bool(np.any(y_seg[:, 3] > 0.5))
+    has_cdeke = bool(np.any(np.abs(y_seg[:, 8:10]) > 0.15))
+
+    if context == CTX_OFFENSE and has_b:
+        return EVT_SHOT
+    if context == CTX_OFFENSE and has_a:
+        return EVT_PASS
+    if context == CTX_DEFENSE and (has_y or has_cdeke):
+        return EVT_DEF_HIT
+    if has_x:
+        return EVT_ITEM
+    return EVT_MOVE
+
+
+def build_segment_metadata(seg_ranges: list, X_mm: np.ndarray, y: np.ndarray) -> list:
+    """Build context/event tags for every trainable segment range."""
+    meta = []
+    for s, e in seg_ranges:
+        x_seg = X_mm[s:e, :430]  # core features only; ignore previous-action tail
+        y_seg = y[s:e]
+        context = classify_segment_context(x_seg)
+        event   = classify_segment_event(context, y_seg)
+        meta.append({"range": (s, e), "context": context, "event": event})
+    return meta
+
+
+def print_segment_distribution(tag: str, meta: list) -> None:
+    """Print context/event counts for a segment metadata list."""
+    ctx_counts = Counter(m["context"] for m in meta)
+    evt_counts = Counter(m["event"] for m in meta)
+    total = max(len(meta), 1)
+    print(f"\n{tag} segments: {len(meta):,}")
+    print("  Context mix:")
+    for c in CTX_NAMES:
+        n = ctx_counts.get(c, 0)
+        print(f"    {c:<10s} {n:>8,}  ({100*n/total:5.1f}%)")
+    print("  Event mix:")
+    for e in EVT_NAMES:
+        n = evt_counts.get(e, 0)
+        print(f"    {e:<10s} {n:>8,}  ({100*n/total:5.1f}%)")
+
+
+def _norm_weights(weights: dict, keys: list) -> dict:
+    vals = [max(0.0, float(weights.get(k, 0.0))) for k in keys]
+    s = sum(vals)
+    if s <= 0:
+        u = 1.0 / max(len(keys), 1)
+        return {k: u for k in keys}
+    return {k: v / s for k, v in zip(keys, vals)}
+
+
+def _allocate_counts(total: int, weights: dict, keys: list) -> dict:
+    """Largest-remainder integer allocation that sums exactly to total."""
+    if total <= 0 or len(keys) == 0:
+        return {k: 0 for k in keys}
+
+    w = _norm_weights(weights, keys)
+    raw = [w[k] * total for k in keys]
+    base = [int(math.floor(x)) for x in raw]
+    rem = total - sum(base)
+    frac_order = np.argsort([x - b for x, b in zip(raw, base)])[::-1]
+    for i in range(rem):
+        base[int(frac_order[i % len(keys)])] += 1
+    return {k: b for k, b in zip(keys, base)}
+
+
+def sample_contextual_segments(seg_meta: list,
+                               target_count: int,
+                               targeted_mix: float,
+                               context_weights: dict,
+                               event_weights: dict,
+                               rng: np.random.Generator) -> list:
+    """Sample train segments with mixed natural + targeted contextual distribution."""
+    if not seg_meta:
+        return []
+
+    n_total = max(1, int(target_count))
+    n_targeted = int(round(n_total * max(0.0, min(1.0, targeted_mix))))
+    n_natural  = max(0, n_total - n_targeted)
+
+    # Natural component: unbiased snapshot of real distribution
+    natural = []
+    if n_natural > 0:
+        natural_idx = rng.choice(len(seg_meta), size=min(n_natural, len(seg_meta)),
+                                 replace=False)
+        natural = [seg_meta[int(i)]["range"] for i in natural_idx]
+
+    # Targeted component: context quotas, then event-weighted draws within context
+    targeted = []
+    ctx_quota = _allocate_counts(n_targeted, context_weights, CTX_NAMES)
+    for ctx in CTX_NAMES:
+        need = ctx_quota[ctx]
+        if need <= 0:
+            continue
+
+        pool_ctx = [m for m in seg_meta if m["context"] == ctx]
+        if not pool_ctx:
+            pool_ctx = seg_meta
+
+        evt_pools = {e: [m for m in pool_ctx if m["event"] == e] for e in EVT_NAMES}
+        evt_keys  = [e for e in EVT_NAMES if evt_pools[e]]
+        if not evt_keys:
+            evt_keys = EVT_NAMES
+            evt_pools = {e: pool_ctx for e in EVT_NAMES}
+
+        evt_quota = _allocate_counts(need, event_weights, evt_keys)
+        for evt in evt_keys:
+            n_evt = evt_quota.get(evt, 0)
+            if n_evt <= 0:
+                continue
+            choices = evt_pools[evt]
+            idxs = rng.integers(0, len(choices), size=n_evt)
+            targeted.extend(choices[int(i)]["range"] for i in idxs)
+
+    # Backfill (can happen due empty pools with strict quotas)
+    if len(targeted) < n_targeted:
+        need = n_targeted - len(targeted)
+        idxs = rng.integers(0, len(seg_meta), size=need)
+        targeted.extend(seg_meta[int(i)]["range"] for i in idxs)
+
+    combined = natural + targeted[:n_targeted]
+    if not combined:
+        combined = [m["range"] for m in seg_meta]
+    rng.shuffle(combined)
+    return combined
+
+
+def sampled_distribution(sampled_ranges: list, seg_lookup: dict) -> tuple:
+    ctx = Counter()
+    evt = Counter()
+    for r in sampled_ranges:
+        c, e = seg_lookup.get(r, (CTX_TRANSITION, EVT_MOVE))
+        ctx[c] += 1
+        evt[e] += 1
+    return ctx, evt
+
+
+def sample_labels_for_pos_weights(seg_ranges: list, y: np.ndarray,
+                                  max_frames: int,
+                                  rng: np.random.Generator) -> np.ndarray:
+    """Collect up to max_frames labels from shuffled segment ranges."""
+    if not seg_ranges:
+        return y[:1]
+
+    order = rng.permutation(len(seg_ranges))
+    chunks = []
+    n = 0
+    for i in order:
+        s, e = seg_ranges[int(i)]
+        if e <= s:
+            continue
+        seg_y = y[s:e]
+        take = min(len(seg_y), max_frames - n)
+        if take <= 0:
+            break
+        chunks.append(seg_y[:take])
+        n += take
+        if n >= max_frames:
+            break
+    if not chunks:
+        s, e = seg_ranges[0]
+        return y[s:min(e, s + 1)]
+    return np.concatenate(chunks, axis=0)
+
+
 def iter_tbptt_batched(X_mm: np.ndarray, y: np.ndarray, seg_ranges: list,
                        T: int, B: int, rng: np.random.Generator,
                        device: torch.device, norm: tuple = None):
@@ -540,6 +750,13 @@ def evaluate(X_mm: np.ndarray, y: np.ndarray, seq_starts: np.ndarray,
             all_stk_pred.append(stk_pred_f)
             all_stk_true.append(stk_true_b.reshape(BT, STICK_DIM).cpu().numpy())
 
+    if n_batches == 0:
+        return {
+            "loss": 0.0, "bce": 0.0, "huber": 0.0,
+            "f1": {k: 0.0 for k in BUTTON_NAMES},
+            "stick_err_deg": 0.0, "idle_acc": 1.0,
+        }
+
     avg_bce    = total_btn_loss / n_batches
     avg_hub    = total_stk_loss / n_batches
     total_loss = avg_bce + avg_hub
@@ -612,7 +829,13 @@ def print_targets(m: dict) -> None:
 
 def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
           epochs: int, batch_size: int, lr: float, seed: int,
-          neutral_keep: float, eval_every: int = 1) -> None:
+          neutral_keep: float,
+          sampler_mode: str,
+          targeted_mix: float,
+          ctx_offense: float, ctx_defense: float, ctx_transition: float,
+          evt_shot: float, evt_pass: float, evt_def_hit: float,
+          evt_item: float, evt_move: float,
+          eval_every: int = 1) -> None:
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -658,37 +881,93 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
     print(f"  Val:   {len(val_seq):>8,} sequences")
     print(f"  Test:  {len(test_seq):>8,} sequences")
 
-    # Sequence-level oversampling on training set (used for val/test eval only)
-    train_seq_s = oversample_seqs(train_seq, y, SEQ_LEN,
-                                  neutral_keep=neutral_keep, seed=seed)
-    action_n  = int(np.sum([
-        np.any(y[s:s + SEQ_LEN, :6] > 0.5) for s in train_seq]))
-    neutral_n = len(train_seq) - action_n
-    print(f"\nOversampling (neutral_keep={neutral_keep:.0%}):")
-    print(f"  Action sequences:        {action_n:>8,}")
-    print(f"  Neutral sequences (kept):{int(neutral_n * neutral_keep):>8,}")
-    print(f"  Training set after OS:   {len(train_seq_s):>8,} sequences")
-
-    # Segment-level oversampling for stateful TBPTT training
-    all_seg_ranges  = build_seg_ranges(seg, N)
-    train_seg_ranges = oversample_segments(
-        [(s, e) for s, e in all_seg_ranges if e <= train_end],
-        y, neutral_keep=neutral_keep, seed=seed)
-    n_chunks_total = sum(max(0, (e - s) // SEQ_LEN) for s, e in train_seg_ranges)
-    print(f"\nStateful TBPTT segments: {len(train_seg_ranges):,}"
-          f"  (~{n_chunks_total:,} chunks of T={SEQ_LEN})")
-
-    # Positive class weights (computed from all frames in training sequences)
-    print()
-    # Gather training labels for weight computation (sample up to 500K frames)
-    sample_starts = train_seq_s[:min(len(train_seq_s), 500_000 // SEQ_LEN)]
-    y_sample = np.concatenate([y[s:s + SEQ_LEN] for s in sample_starts])
-    pos_weights, btn_rates = compute_pos_weights(y_sample)
-    del y_sample
-
     # Open X memmap
     print(f"\nOpening X memmap: {x_path}", flush=True)
     X_mm = np.lib.format.open_memmap(x_path, mode="r")
+
+    all_seg_ranges = build_seg_ranges(seg, N)
+    train_seg_base = [(s, e) for s, e in all_seg_ranges if e <= train_end]
+
+    context_weights = {
+        CTX_OFFENSE: ctx_offense,
+        CTX_DEFENSE: ctx_defense,
+        CTX_TRANSITION: ctx_transition,
+    }
+    event_weights = {
+        EVT_SHOT: evt_shot,
+        EVT_PASS: evt_pass,
+        EVT_DEF_HIT: evt_def_hit,
+        EVT_ITEM: evt_item,
+        EVT_MOVE: evt_move,
+    }
+
+    seg_lookup = {}
+    train_seg_meta = []
+    if sampler_mode == "legacy":
+        # Legacy sequence-level oversampling (retained for A/B comparison)
+        train_seq_s = oversample_seqs(train_seq, y, SEQ_LEN,
+                                      neutral_keep=neutral_keep, seed=seed)
+        action_n  = int(np.sum([
+            np.any(y[s:s + SEQ_LEN, :6] > 0.5) for s in train_seq]))
+        neutral_n = len(train_seq) - action_n
+        print(f"\nLegacy oversampling (neutral_keep={neutral_keep:.0%}):")
+        print(f"  Action sequences:        {action_n:>8,}")
+        print(f"  Neutral sequences (kept):{int(neutral_n * neutral_keep):>8,}")
+        print(f"  Training set after OS:   {len(train_seq_s):>8,} sequences")
+
+        train_seg_ranges_base = oversample_segments(
+            train_seg_base, y, neutral_keep=neutral_keep, seed=seed)
+        seg_lookup = {(s, e): (CTX_TRANSITION, EVT_MOVE) for s, e in train_seg_ranges_base}
+
+        # Gather labels for pos_weight computation (sample up to 500K frames)
+        print()
+        sample_starts = train_seq_s[:min(len(train_seq_s), 500_000 // SEQ_LEN)]
+        if len(sample_starts):
+            y_sample = np.concatenate([y[s:s + SEQ_LEN] for s in sample_starts])
+        else:
+            y_sample = y[:SEQ_LEN]
+    else:
+        print("\nContextual sampler configuration:")
+        print(f"  targeted_mix={targeted_mix:.0%}  natural_mix={1.0-targeted_mix:.0%}")
+        print("  context weights:"
+              f" offense={ctx_offense:.2f} defense={ctx_defense:.2f} transition={ctx_transition:.2f}")
+        print("  event weights:"
+              f" shot={evt_shot:.2f} pass={evt_pass:.2f} def_hit={evt_def_hit:.2f}"
+              f" item={evt_item:.2f} move={evt_move:.2f}")
+
+        train_seg_meta = build_segment_metadata(train_seg_base, X_mm, y)
+        print_segment_distribution("Base train", train_seg_meta)
+        seg_lookup = {m["range"]: (m["context"], m["event"]) for m in train_seg_meta}
+
+        rng_init = np.random.default_rng(seed)
+        train_seg_ranges_base = sample_contextual_segments(
+            train_seg_meta, len(train_seg_meta), targeted_mix,
+            context_weights, event_weights, rng_init
+        )
+        ctx_c, evt_c = sampled_distribution(train_seg_ranges_base, seg_lookup)
+        total = max(len(train_seg_ranges_base), 1)
+        print("\nInitial sampled segment mix:")
+        print("  Context:")
+        for c in CTX_NAMES:
+            n = ctx_c.get(c, 0)
+            print(f"    {c:<10s} {n:>8,}  ({100*n/total:5.1f}%)")
+        print("  Events:")
+        for e_name in EVT_NAMES:
+            n = evt_c.get(e_name, 0)
+            print(f"    {e_name:<10s} {n:>8,}  ({100*n/total:5.1f}%)")
+
+        # Gather labels for pos_weight computation from sampled train segments
+        print()
+        y_sample = sample_labels_for_pos_weights(
+            train_seg_ranges_base, y, max_frames=500_000, rng=np.random.default_rng(seed + 1)
+        )
+
+    pos_weights, _ = compute_pos_weights(y_sample)
+    del y_sample
+
+    n_chunks_total = sum(max(0, (e - s) // SEQ_LEN) for s, e in train_seg_ranges_base)
+    print(f"\nStateful TBPTT segments: {len(train_seg_ranges_base):,}"
+          f"  (~{n_chunks_total:,} chunks of T={SEQ_LEN})")
 
     # Normalization stats — computed from training portion only (no val/test leakage)
     print(f"\nComputing normalization stats over {train_end:,} training frames...",
@@ -725,6 +1004,23 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
         t0 = time.time()
 
         rng = np.random.default_rng(seed + epoch)
+        if sampler_mode == "contextual":
+            train_seg_ranges = sample_contextual_segments(
+                train_seg_meta, len(train_seg_meta), targeted_mix,
+                context_weights, event_weights, rng
+            )
+            if epoch == 1 or epoch % 5 == 0:
+                ctx_c, evt_c = sampled_distribution(train_seg_ranges, seg_lookup)
+                total = max(len(train_seg_ranges), 1)
+                ctx_str = "  ".join(f"{c}={100*ctx_c.get(c,0)/total:.1f}%"
+                                    for c in CTX_NAMES)
+                evt_str = "  ".join(f"{e}={100*evt_c.get(e,0)/total:.1f}%"
+                                    for e in EVT_NAMES)
+                print(f"\n  Sampler mix (epoch {epoch}):")
+                print(f"    Context: {ctx_str}")
+                print(f"    Events:  {evt_str}")
+        else:
+            train_seg_ranges = train_seg_ranges_base
 
         # Stateful TBPTT: h/c carried across chunks within each segment,
         # reset only when a stream starts a new segment.
@@ -795,7 +1091,7 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
                       f"stk_ce={epoch_hub/(batch_i+1):.4f}",
                       flush=True)
 
-        n_batches  = batch_i + 1
+        n_batches  = max(1, batch_i + 1)
         train_bce  = epoch_bce / n_batches
         train_hub  = epoch_hub / n_batches
         train_loss = train_bce + train_hub
@@ -874,11 +1170,35 @@ if __name__ == "__main__":
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--neutral-keep", type=float, default=0.20,
-                        help="Fraction of neutral sequences to keep (default 0.20)")
+                        help="Legacy sampler only: fraction of neutral sequences/segments kept")
+    parser.add_argument("--sampler",      choices=["contextual", "legacy"],
+                        default="contextual",
+                        help="Sampling strategy for training segments (default contextual)")
+    parser.add_argument("--targeted-mix", type=float, default=0.60,
+                        help="Contextual sampler: fraction of targeted samples per epoch")
+    parser.add_argument("--ctx-offense",  type=float, default=0.40,
+                        help="Contextual sampler weight for offense segments")
+    parser.add_argument("--ctx-defense",  type=float, default=0.40,
+                        help="Contextual sampler weight for defense segments")
+    parser.add_argument("--ctx-transition", type=float, default=0.20,
+                        help="Contextual sampler weight for transition segments")
+    parser.add_argument("--evt-shot",     type=float, default=0.25,
+                        help="Contextual sampler event weight: shot")
+    parser.add_argument("--evt-pass",     type=float, default=0.20,
+                        help="Contextual sampler event weight: pass")
+    parser.add_argument("--evt-def-hit",  type=float, default=0.20,
+                        help="Contextual sampler event weight: defensive hit/deke")
+    parser.add_argument("--evt-item",     type=float, default=0.10,
+                        help="Contextual sampler event weight: item usage")
+    parser.add_argument("--evt-move",     type=float, default=0.25,
+                        help="Contextual sampler event weight: movement/positioning")
     parser.add_argument("--eval-every",   type=int,   default=1,
                         help="Run validation every N epochs (default 1)")
     args = parser.parse_args()
 
     train(args.x_path, args.y_path, args.ms_path, args.seg_path, args.out_dir,
           args.epochs, args.batch, args.lr, args.seed, args.neutral_keep,
+          args.sampler, args.targeted_mix,
+          args.ctx_offense, args.ctx_defense, args.ctx_transition,
+          args.evt_shot, args.evt_pass, args.evt_def_hit, args.evt_item, args.evt_move,
           eval_every=args.eval_every)
