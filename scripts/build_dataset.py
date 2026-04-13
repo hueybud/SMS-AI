@@ -2,34 +2,40 @@
 """build_dataset.py — Build ML training dataset from v11 CITF files.
 
 Usage:
-    python build_dataset.py <citf_dir> <discord_id> <output.npz> [--stats] [--resume <manifest.json>]
+    python build_dataset.py <citf_dir> <output> --experts 774682411052040202,9876543210
+    python build_dataset.py <citf_dir> <output> --experts-file experts.txt [--stats] [--resume <manifest.json>]
 
 Arguments:
-    citf_dir      Directory to search recursively for *.citframes files
-    discord_id    Discord user ID (integer) of the training subject
-    output        Output base path (suffixes _X.npy / _y.npy / _ms.npy / _seg.npy /
-                  _manifest.json added)
-    --stats       Print feature and label statistics after building
-    --resume      Path to an existing _manifest.json to skip already-processed matches
+    citf_dir          Directory to search recursively for *.citframes files
+    output            Output base path (suffixes _X.npy / _y.npy / _ms.npy / _seg.npy /
+                      _manifest.json added)
+    --experts         Comma-separated list of allowlisted expert discord IDs
+    --experts-file    Path to a text file with one discord ID per line (alternative to --experts)
+    --stats           Print feature and label statistics after building
+    --resume          Path to an existing _manifest.json to skip already-processed games
 
 Output files:
-    <output>_X.npy            float32 (N, FEATURE_DIM) — input features per frame
+    <output>_X.npy            float16 (N, FEATURE_DIM) — input features per frame
     <output>_y.npy            float32 (N, LABEL_DIM)   — controller labels per frame
     <output>_ms.npy           int64   (M,)              — match start frame indices
     <output>_seg.npy          int32   (N,)              — segment ID per frame
                                                           (monotonically increasing;
                                                           new ID on match start, frame gap,
                                                           or kickoff↔active transition)
-    <output>_manifest.json    JSON record of all (epoch, discord_id) keys included
+    <output>_manifest.json    JSON record of all processed game keys and expert IDs
 
-Deduplication: keyed on (epoch, discord_id). One entry per match per subject.
+Deduplication: keyed on (room_id, uuidv5(sorted goal timestamps)).
+    If the same game is submitted by multiple players, it is processed exactly once.
+    From that one game, inputs are extracted for EVERY allowlisted expert port found.
+    Games with no allowlisted expert on either side are skipped entirely.
+
 Frame filter:  gamePhase in {1, 4, 5} (kickoff + active play) and not isPaused.
                Goalie-controlled frames are included via a goalie-compatible feature encoding.
-Canonical mirror: if subject's team attacks left, all X coords and velocities
+Canonical mirror: if expert's team attacks left, all X coords and velocities
                   are negated so the model always sees "attacks right".
 """
 
-import sys, math, argparse, struct, json
+import os, sys, math, argparse, struct, json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
@@ -112,14 +118,16 @@ _RIGHT_GOALIE_SLOT   = 9
 # Tactical summary:                              5
 #   self_dist/40 + self_rank/3 + is_nearest + nearest_enemy_dist/40 + enemy_in_path
 # Score diff + time elapsed fraction:            2
+# Possession booleans:                           2
+#   friendly_has_ball + enemy_has_ball
 # Previous frame action (buttons + sticks):     10
 #   A, B, X, Y, L, R (0/1), stick_x, stick_y, cstick_x, cstick_y ([-1,1])
 #   Zeroed at segment boundaries (match start, phase transitions, frame gaps)
 # ──────────────────────────────────────────────────
-# Total:                                        440
+# Total:                                        442
 
 PREV_ACTION_DIM = 10   # previous frame's labels appended as the last block
-FEATURE_DIM     = 430 + PREV_ACTION_DIM  # 440
+FEATURE_DIM     = 432 + PREV_ACTION_DIM  # 442
 LABEL_DIM       = 10
 
 
@@ -160,6 +168,21 @@ def _heading_sincos(heading_u16: int) -> Tuple[float, float]:
 
 
 # ---- Subject / team identification ------------------------------------------
+
+def _is_human_vs_human(header: CaptureHeader) -> Tuple[bool, str]:
+    """Return (ok, reason). Requires v11+ header.
+    Passes if exactly one human (non-zero discord_id) is on each team.
+    """
+    humans = []
+    for port_idx, (player, team) in enumerate(zip(header.port_players, header.port_teams)):
+        if player.discord_id != 0:
+            humans.append((port_idx, player.discord_id, team))
+    if len(humans) != 2:
+        return False, f"{len(humans)} human(s) found (expected 2)"
+    if humans[0][2] == humans[1][2]:
+        return False, f"both humans on same team ({humans[0][2]})"
+    return True, "ok"
+
 
 def _find_subject_port(header: CaptureHeader, discord_id: int) -> Optional[int]:
     """Return GC port index (0-3) for the training subject, or None if absent."""
@@ -215,6 +238,44 @@ def _resolve_owner_slot(frame: GameStateFrame) -> int:
         if ptr == frame.ball_owner_ptr:
             return i
     return 10
+
+
+# ---- Game-level deduplication -----------------------------------------------
+
+def _compute_game_key(header: CaptureHeader,
+                      frames: List[GameStateFrame]) -> str:
+    """Compute a canonical game key stable across duplicate submissions.
+
+    Key: "<room_id_hex>:<t1:.3f>,<t2:.3f>,..."
+
+    Goal timestamps are derived from score-counter increments — the same
+    method used in validate_goals.py.  Using score increments (rather than
+    phase transitions) keeps the detection logic identical to what the
+    validation pipeline already verified, and game_time values are formatted
+    to 3 decimal places for a stable string representation.
+
+    Two submissions of the same game will have the same room_id and the same
+    sorted goal times, so their keys are guaranteed equal.
+    """
+    times = []
+    for i in range(1, len(frames)):
+        if frames[i].left_score > frames[i - 1].left_score:
+            times.append(frames[i].game_time)
+        if frames[i].right_score > frames[i - 1].right_score:
+            times.append(frames[i].game_time)
+    times.sort()
+    goals_str = ",".join(f"{t:.3f}" for t in times)
+    return f"{header.room_id:08X}:{goals_str}"
+
+
+def _find_expert_ports(header: CaptureHeader,
+                       expert_ids: Set[int]) -> List[Tuple[int, int]]:
+    """Return [(port_index, discord_id), ...] for each allowlisted expert in this game."""
+    result = []
+    for port, player in enumerate(header.port_players):
+        if player.discord_id in expert_ids:
+            result.append((port, player.discord_id))
+    return result
 
 
 # ---- Feature extraction ------------------------------------------------------
@@ -383,8 +444,14 @@ def extract_features(header: CaptureHeader,
     mt = max(header.match_time_allotted, 1)
     feat += [min(frame.game_time / mt, 1.0)]                 # elapsed fraction
 
-    assert len(feat) == 430, (
-        f"Core feature dim mismatch: got {len(feat)}, expected 430"
+    # --- 12. Possession booleans (2) ---
+    friendly_slots = set(_LEFT_STRIKER_SLOTS + [_LEFT_GOALIE_SLOT]) if subject_team == LEFT_TEAM \
+                     else set(_RIGHT_STRIKER_SLOTS + [_RIGHT_GOALIE_SLOT])
+    feat += [float(owner_slot in friendly_slots)]            # friendly_has_ball
+    feat += [float(owner_slot != 10 and owner_slot not in friendly_slots)]  # enemy_has_ball
+
+    assert len(feat) == 432, (
+        f"Core feature dim mismatch: got {len(feat)}, expected 432"
     )
     return feat
 
@@ -455,15 +522,17 @@ CHECKPOINT_INTERVAL = 100  # save partial results every N matched files
 
 def _save_checkpoint(X_chunks: list, y_chunks: list, seg_chunks: list,
                      window_match_starts: list,
-                     output_path: str, ckpt_num: int) -> str:
+                     output_path: str, ckpt_num: int, ckpt_dir: str) -> str:
     """Write checkpoint incrementally via memmap — never concatenates full arrays."""
-    ckpt_base = f"{output_path}.ckpt{ckpt_num}"
+    os.makedirs(ckpt_dir, exist_ok=True)
+    stem = os.path.basename(output_path)
+    ckpt_base = os.path.join(ckpt_dir, f"{stem}.ckpt{ckpt_num}")
     n_rows   = sum(c.shape[0] for c in X_chunks)
     feat_dim = X_chunks[0].shape[1]
     lbl_dim  = y_chunks[0].shape[1]
 
     X_mm = np.lib.format.open_memmap(
-        ckpt_base + "_X.npy", mode="w+", dtype=np.float32, shape=(n_rows, feat_dim))
+        ckpt_base + "_X.npy", mode="w+", dtype=np.float16, shape=(n_rows, feat_dim))
     y_mm = np.lib.format.open_memmap(
         ckpt_base + "_y.npy", mode="w+", dtype=np.float32, shape=(n_rows, lbl_dim))
     s_mm = np.lib.format.open_memmap(
@@ -482,21 +551,22 @@ def _save_checkpoint(X_chunks: list, y_chunks: list, seg_chunks: list,
     return ckpt_base
 
 
-def _save_partial_manifest(output_path: str, discord_id: int, seen_keys: set,
+def _save_partial_manifest(output_path: str, expert_ids: Set[int],
+                           seen_game_keys: Set[str],
                            ckpt_paths: list, global_frame_idx: int,
                            seg_counter: int) -> None:
     """Write a partial manifest after each checkpoint for preemption recovery.
 
     On resume, build_dataset reads this file via --resume and restores
     ckpt_paths / global_frame_idx / seg_counter so the new run continues
-    seamlessly without reprocessing already-captured matches.
+    seamlessly without reprocessing already-captured games.
     """
     output_base = output_path[:-4] if output_path.endswith(".npz") else output_path
     manifest = {
         "partial": True,
-        "discord_id": discord_id,
+        "expert_ids": sorted(expert_ids),
         "build_date": datetime.now(timezone.utc).isoformat(),
-        "seen_keys": sorted([epoch, did] for epoch, did in seen_keys),
+        "seen_game_keys": sorted(seen_game_keys),
         "checkpoints": ckpt_paths,
         "global_frame_idx": global_frame_idx,
         "seg_counter": seg_counter,
@@ -544,7 +614,7 @@ def _merge_to_memmap(
     print(f"  Allocating {total_rows * feature_dim * 4 / 1e9:.1f} GB → {x_path}",
           flush=True)
     X_mm = np.lib.format.open_memmap(
-        x_path, mode="w+", dtype=np.float32, shape=(total_rows, feature_dim)
+        x_path, mode="w+", dtype=np.float16, shape=(total_rows, feature_dim)
     )
     y_mm = np.lib.format.open_memmap(
         y_path, mode="w+", dtype=np.float32, shape=(total_rows, label_dim)
@@ -593,7 +663,7 @@ def _merge_to_memmap(
 
 # ---- Main -------------------------------------------------------------------
 
-def build_dataset(citf_dir: str, discord_id: int,
+def build_dataset(citf_dir: str, expert_ids: Set[int],
                   output_path: str, print_stats: bool,
                   limit: Optional[int] = None,
                   resume_manifest: Optional[str] = None) -> None:
@@ -603,52 +673,56 @@ def build_dataset(citf_dir: str, discord_id: int,
         citf_paths = citf_paths[:limit]
     total_files = len(citf_paths)
     print(f"Found {total_files} .citframes files", flush=True)
+    print(f"Expert IDs: {sorted(expert_ids)}", flush=True)
 
-    seen_keys: Set[Tuple[int, int]] = set()
-
-    # Pre-seed seen_keys from a prior manifest so already-processed matches are skipped
-    if resume_manifest:
-        with open(resume_manifest) as f:
-            manifest_data = json.load(f)
-        for epoch, did in manifest_data["seen_keys"]:
-            seen_keys.add((epoch, did))
-        print(f"Resumed from manifest: {len(seen_keys):,} matches already seen "
-              f"({resume_manifest})", flush=True)
-        # Restore mid-run state from a partial (preempted) manifest so existing
-        # checkpoint files are included in the final merge and frame/segment
-        # counters continue from where the interrupted run left off.
-        if manifest_data.get("partial"):
-            ckpt_paths       = manifest_data.get("checkpoints", [])
-            global_frame_idx = manifest_data.get("global_frame_idx", 0)
-            seg_counter      = manifest_data.get("seg_counter", 0)
-            print(f"  Partial resume: {len(ckpt_paths)} checkpoint(s) on disk, "
-                  f"global_frame_idx={global_frame_idx:,}, "
-                  f"seg_counter={seg_counter:,}", flush=True)
+    seen_game_keys: Set[str] = set()
 
     X_chunks:   List["np.ndarray"] = []
     y_chunks:   List["np.ndarray"] = []
     seg_chunks: List["np.ndarray"] = []
     ckpt_paths: List[str] = []
+    global_frame_idx = 0
+    ckpt_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tmp_checkpoints")
+    seg_counter      = 0
 
-    # match_starts: absolute frame index where each new match begins.
-    # Stored as int64 in the final .npz alongside X and y.
-    # Enables temporal models to assemble windows without crossing match boundaries.
-    all_match_starts: List[int] = []  # absolute indices across entire dataset
-    ms_window_start  = 0              # index into all_match_starts for current ckpt window
-    global_frame_idx = 0              # absolute frame counter across all checkpoints
+    # Pre-seed from a prior manifest so already-processed games are skipped.
+    # Only new-format manifests (with seen_game_keys) are compatible.
+    if resume_manifest:
+        with open(resume_manifest) as f:
+            manifest_data = json.load(f)
+        if "seen_game_keys" in manifest_data:
+            for key in manifest_data["seen_game_keys"]:
+                seen_game_keys.add(key)
+            print(f"Resumed from manifest: {len(seen_game_keys):,} games already seen "
+                  f"({resume_manifest})", flush=True)
+            if manifest_data.get("partial"):
+                ckpt_paths       = manifest_data.get("checkpoints", [])
+                global_frame_idx = manifest_data.get("global_frame_idx", 0)
+                seg_counter      = manifest_data.get("seg_counter", 0)
+                print(f"  Partial resume: {len(ckpt_paths)} checkpoint(s), "
+                      f"global_frame_idx={global_frame_idx:,}, "
+                      f"seg_counter={seg_counter:,}", flush=True)
+        else:
+            print(f"  WARN: manifest uses old (epoch, discord_id) format — "
+                  f"cannot resume; starting fresh.", flush=True)
 
-    # Running label sums for anomaly detection (updated every matched file)
+    # match_starts: absolute frame index where each expert-game entry begins.
+    # One entry per (unique game × expert port) combination.
+    all_match_starts: List[int] = []
+    ms_window_start  = 0
+
     running_y_sum   = np.zeros(LABEL_DIM, dtype=np.float64)
     running_y_count = 0
 
-    n_no_subject    = 0
-    n_dedup         = 0
-    n_filtered      = 0
-    n_goalie_frames = 0
-    n_matched       = 0
-    total_frames  = 0
-    seg_counter   = 0  # global segment ID, monotonically increases across all matches
-    t_start       = time.time()
+    n_no_experts    = 0   # games where no allowlisted expert appears
+    n_not_hvh       = 0
+    n_dedup         = 0   # duplicate game submissions skipped
+    n_filtered      = 0   # raw frames excluded by phase/pause filter (counted once per game)
+    n_goalie_frames = 0   # kept frames where the expert controls the goalie
+    n_matched       = 0   # unique games processed
+    n_expert_entries = 0  # total (game × expert) entries written
+    total_frames    = 0
+    t_start         = time.time()
 
     for file_idx, path in enumerate(citf_paths):
 
@@ -657,11 +731,11 @@ def build_dataset(citf_dir: str, discord_id: int,
             elapsed = time.time() - t_start
             rate    = file_idx / elapsed
             eta     = (total_files - file_idx) / rate if rate > 0 else 0
-            print(f"\n[{file_idx:4d}/{total_files}]  matched={n_matched}  "
-                  f"frames={total_frames:,}  elapsed={elapsed:.0f}s  eta={eta:.0f}s",
+            print(f"\n[{file_idx:4d}/{total_files}]  unique_games={n_matched}  "
+                  f"expert_entries={n_expert_entries}  frames={total_frames:,}  "
+                  f"elapsed={elapsed:.0f}s  eta={eta:.0f}s",
                   flush=True)
 
-            # Rolling button press rates + anomaly flags
             if running_y_count > 0:
                 rates = running_y_sum / running_y_count
                 parts = []
@@ -671,11 +745,11 @@ def build_dataset(citf_dir: str, discord_id: int,
                     parts.append(f"{LABEL_NAMES[i]}={r:.3f}")
                     lo, hi = _BTN_EXPECTED[i]
                     if not (lo <= r <= hi):
-                        flags.append(f"⚠ {LABEL_NAMES[i]} rate {r:.3f} "
+                        flags.append(f"  WARNING: {LABEL_NAMES[i]} rate {r:.3f} "
                                      f"outside expected [{lo:.3f}, {hi:.3f}]")
                 print(f"  Rates: {' | '.join(parts)}", flush=True)
                 for flag in flags:
-                    print(f"  {flag}", flush=True)
+                    print(flag, flush=True)
 
         # ---- Load and parse file -------------------------------------------
         try:
@@ -690,125 +764,135 @@ def build_dataset(citf_dir: str, discord_id: int,
             print(f"  SKIP {path.name}: version {header.version} < 11", flush=True)
             continue
 
-        subject_port = _find_subject_port(header, discord_id)
-        if subject_port is None:
-            n_no_subject += 1
+        ok_hvh, hvh_reason = _is_human_vs_human(header)
+        if not ok_hvh:
+            n_not_hvh += 1
             continue
 
-        key = (header.epoch, discord_id)
-        if key in seen_keys:
-            n_dedup += 1
-            continue
-        seen_keys.add(key)
-
-        subject_team = _get_subject_team(header, subject_port)
-        n_matched += 1
-
-        # Per-file accumulation — convert to numpy once per file
-        file_X:   List[List[float]] = []
-        file_y:   List[List[float]] = []
-        file_seg: List[int] = []
-
-        # Segment tracking: a new segment starts on match start, after a gap of
-        # filtered frames, or when the phase family changes (kickoff ↔ active play).
-        prev_was_active    = False   # was the immediately prior raw frame kept?
-        prev_phase_family  = -1      # 1=kickoff, 4=active; -1=unset
-        prev_labels        = [0.0] * LABEL_DIM  # previous frame's action (zeros at segment start)
-
+        # ---- Parse all frames (one pass — reused for dedup + per-expert extraction) ---
+        frames: List[GameStateFrame] = []
         offset = header.header_size
         for _ in range(header.frame_count):
             frame, consumed = parse_frame(data, offset, header.fixed_frame_size)
+            frames.append(frame)
             offset += consumed
 
+        # ---- Game-level dedup ----------------------------------------------
+        game_key = _compute_game_key(header, frames)
+        if game_key in seen_game_keys:
+            n_dedup += 1
+            continue
+        seen_game_keys.add(game_key)
+
+        # ---- Require at least one allowlisted expert -----------------------
+        expert_ports = _find_expert_ports(header, expert_ids)
+        if not expert_ports:
+            n_no_experts += 1
+            continue
+
+        n_matched += 1
+
+        # Count filtered frames once per game (informational; not multiplied by experts)
+        for frame in frames:
             if frame.game_phase not in (1, 4, 5) or frame.is_paused:
-                n_filtered    += 1
-                prev_was_active = False  # gap → force segment break on next kept frame
-                continue
+                n_filtered += 1
 
-            self_slot, is_goalie = _find_self_slot(frame, subject_team)
-            if is_goalie:
-                n_goalie_frames += 1
+        # ---- Extract features for each expert found in this game -----------
+        for subject_port, subject_discord_id in expert_ports:
+            subject_team = _get_subject_team(header, subject_port)
 
-            phase_family = 1 if frame.game_phase == 1 else 4
+            file_X:   List[List[float]] = []
+            file_y:   List[List[float]] = []
+            file_seg: List[int] = []
 
-            # New segment when:
-            #   • first kept frame of this match (prev_was_active is False), OR
-            #   • phase family switched (kickoff → active or vice versa)
-            if not prev_was_active or phase_family != prev_phase_family:
-                seg_counter += 1
-                prev_labels = [0.0] * LABEL_DIM  # reset previous action at segment boundary
+            prev_was_active   = False
+            prev_phase_family = -1
+            prev_labels       = [0.0] * LABEL_DIM
 
-            curr_labels = extract_labels(frame, subject_port, subject_team)
-            feat = extract_features(header, frame, subject_team, self_slot, is_goalie) + prev_labels
-            file_X.append(feat)
-            file_y.append(curr_labels)
-            file_seg.append(seg_counter)
+            for frame in frames:
+                if frame.game_phase not in (1, 4, 5) or frame.is_paused:
+                    prev_was_active = False
+                    continue
 
-            prev_labels       = curr_labels
-            prev_was_active   = True
-            prev_phase_family = phase_family
+                self_slot, is_goalie = _find_self_slot(frame, subject_team)
+                if is_goalie:
+                    n_goalie_frames += 1
 
-        if file_X:
-            arr_X   = np.array(file_X,   dtype=np.float32)
-            arr_y   = np.array(file_y,   dtype=np.float32)
-            arr_seg = np.array(file_seg, dtype=np.int32)
-            # Record match boundary at the absolute frame index before appending
-            all_match_starts.append(global_frame_idx)
-            X_chunks.append(arr_X)
-            y_chunks.append(arr_y)
-            seg_chunks.append(arr_seg)
-            total_frames      += len(file_X)
-            global_frame_idx  += len(file_X)
-            running_y_sum     += arr_y.sum(axis=0)
-            running_y_count   += len(arr_y)
+                phase_family = 1 if frame.game_phase == 1 else 4
 
-        # ---- Checkpoint every CHECKPOINT_INTERVAL matched files ------------
+                if not prev_was_active or phase_family != prev_phase_family:
+                    seg_counter += 1
+                    prev_labels  = [0.0] * LABEL_DIM
+
+                curr_labels = extract_labels(frame, subject_port, subject_team)
+                feat = (extract_features(header, frame, subject_team, self_slot, is_goalie)
+                        + prev_labels)
+                file_X.append(feat)
+                file_y.append(curr_labels)
+                file_seg.append(seg_counter)
+
+                prev_labels       = curr_labels
+                prev_was_active   = True
+                prev_phase_family = phase_family
+
+            if file_X:
+                arr_X   = np.array(file_X,   dtype=np.float32)
+                arr_y   = np.array(file_y,   dtype=np.float32)
+                arr_seg = np.array(file_seg, dtype=np.int32)
+                all_match_starts.append(global_frame_idx)
+                X_chunks.append(arr_X)
+                y_chunks.append(arr_y)
+                seg_chunks.append(arr_seg)
+                total_frames     += len(file_X)
+                global_frame_idx += len(file_X)
+                running_y_sum    += arr_y.sum(axis=0)
+                running_y_count  += len(arr_y)
+                n_expert_entries += 1
+
+        # ---- Checkpoint every CHECKPOINT_INTERVAL unique games -------------
         if n_matched > 0 and n_matched % CHECKPOINT_INTERVAL == 0:
-            ckpt_num       = len(ckpt_paths) + 1  # avoids overwriting existing ckpts on resume
+            ckpt_num       = len(ckpt_paths) + 1
             window_ms      = all_match_starts[ms_window_start:]
             frames_in_ckpt = sum(len(c) for c in X_chunks)
             ckpt_path = _save_checkpoint(X_chunks, y_chunks, seg_chunks, window_ms,
-                                         output_path, ckpt_num)
+                                         output_path, ckpt_num, ckpt_dir)
             ckpt_paths.append(ckpt_path)
-            _save_partial_manifest(output_path, discord_id, seen_keys,
+            _save_partial_manifest(output_path, expert_ids, seen_game_keys,
                                    ckpt_paths, global_frame_idx, seg_counter)
             X_chunks        = []
             y_chunks        = []
             seg_chunks      = []
             ms_window_start = len(all_match_starts)
-            print(f"\n  ✓ Checkpoint {ckpt_num} saved ({frames_in_ckpt:,} frames, "
-                  f"{len(window_ms)} matches) → {Path(ckpt_path).name}", flush=True)
+            print(f"\n  Checkpoint {ckpt_num} saved ({frames_in_ckpt:,} frames, "
+                  f"{len(window_ms)} entries) → {Path(ckpt_path).name}", flush=True)
 
     # ---- Final summary ------------------------------------------------------
     elapsed = time.time() - t_start
     print(f"\n{'='*60}", flush=True)
     print(f"COMPLETE", flush=True)
-    print(f"  Matched files (subject found)   : {n_matched}", flush=True)
-    print(f"  Skipped — subject absent        : {n_no_subject}", flush=True)
-    print(f"  Skipped — dedup                 : {n_dedup}", flush=True)
+    print(f"  Unique games processed          : {n_matched}", flush=True)
+    print(f"  Expert-game entries written     : {n_expert_entries}", flush=True)
+    print(f"  Skipped — no expert present     : {n_no_experts}", flush=True)
+    print(f"  Skipped — not HvH               : {n_not_hvh}", flush=True)
+    print(f"  Skipped — duplicate game        : {n_dedup}", flush=True)
     print(f"  Frames kept (phase 1/4/5)       : {total_frames:,}", flush=True)
     print(f"  Frames filtered (non-active)    : {n_filtered:,}", flush=True)
     print(f"  Frames kept (goalie control)    : {n_goalie_frames:,}", flush=True)
     print(f"  Segments created                : {seg_counter:,}", flush=True)
-    print(f"  Checkpoints written           : {len(ckpt_paths)}", flush=True)
-    print(f"  Wall time                     : {elapsed:.1f}s  "
+    print(f"  Checkpoints written             : {len(ckpt_paths)}", flush=True)
+    print(f"  Wall time                       : {elapsed:.1f}s  "
           f"({elapsed/60:.1f} min)", flush=True)
     print(f"{'='*60}", flush=True)
 
     if not X_chunks and not ckpt_paths:
-        print("\nERROR: No frames collected. Verify discord_id and citf_dir.",
+        print("\nERROR: No frames collected. Check --experts IDs and citf_dir.",
               flush=True)
         sys.exit(1)
 
-    # Merge checkpoints + any trailing in-memory chunks into memory-mapped .npy files
     print("\nMerging and saving final dataset...", flush=True)
     remaining_ms = np.array(all_match_starts[ms_window_start:], dtype=np.int64)
 
-    # Strip .npz extension if present so output base names are clean
-    if output_path.endswith(".npz"):
-        output_base = output_path[:-4]
-    else:
-        output_base = output_path
+    output_base = output_path[:-4] if output_path.endswith(".npz") else output_path
 
     X, y, ms = _merge_to_memmap(ckpt_paths, X_chunks, y_chunks, seg_chunks,
                                  remaining_ms, output_base)
@@ -829,8 +913,8 @@ def build_dataset(citf_dir: str, discord_id: int,
     print(f"  y   → {y_path}", flush=True)
     print(f"  ms  → {ms_path}", flush=True)
     print(f"  seg → {seg_path}  ({seg_counter:,} unique segments)", flush=True)
-    print(f"  match_starts: {len(ms):,} matches  "
-          f"(avg {X.shape[0]//max(len(ms),1):,} frames/match)", flush=True)
+    print(f"  match_starts: {len(ms):,} entries  "
+          f"(avg {X.shape[0]//max(len(ms),1):,} frames/entry)", flush=True)
 
     if print_stats:
         _print_stats(X, y)
@@ -838,9 +922,10 @@ def build_dataset(citf_dir: str, discord_id: int,
     # ---- Write manifest -----------------------------------------------------
     manifest_path = output_base + "_manifest.json"
     manifest = {
-        "discord_id": discord_id,
+        "expert_ids": sorted(expert_ids),
         "build_date": datetime.now(timezone.utc).isoformat(),
-        "matched_files": n_matched,
+        "unique_games": n_matched,
+        "expert_entries": n_expert_entries,
         "total_frames": int(X.shape[0]),
         "output_files": {
             "X":   x_path,
@@ -848,13 +933,11 @@ def build_dataset(citf_dir: str, discord_id: int,
             "ms":  ms_path,
             "seg": seg_path,
         },
-        # Sorted list of [epoch, discord_id] pairs — used by --resume to skip
-        # already-processed matches when new CITFs are added later.
-        "seen_keys": sorted([epoch, did] for epoch, did in seen_keys),
+        "seen_game_keys": sorted(seen_game_keys),
     }
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    print(f"  manifest → {manifest_path}  ({len(seen_keys):,} keys)", flush=True)
+    print(f"  manifest → {manifest_path}  ({len(seen_game_keys):,} game keys)", flush=True)
 
 
 def _print_stats(X: "np.ndarray", y: "np.ndarray") -> None:
@@ -881,18 +964,36 @@ def _print_stats(X: "np.ndarray", y: "np.ndarray") -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Build CITF → numpy ML training dataset"
+        description="Build CITF → numpy ML training dataset (multi-expert, game-level dedup)"
     )
-    parser.add_argument("citf_dir",    help="Directory to search for *.citframes files")
-    parser.add_argument("discord_id",  type=int, help="Discord user ID of training subject")
-    parser.add_argument("output",      help="Output .npz path (e.g. dataset.npz)")
-    parser.add_argument("--stats",     action="store_true",
+    parser.add_argument("citf_dir", help="Directory to search recursively for *.citframes files")
+    parser.add_argument("output",   help="Output base path (e.g. sweetieman_v4)")
+
+    expert_group = parser.add_mutually_exclusive_group(required=True)
+    expert_group.add_argument(
+        "--experts", metavar="IDS",
+        help="Comma-separated allowlisted expert discord IDs  "
+             "(e.g. 774682411052040202,9876543210)")
+    expert_group.add_argument(
+        "--experts-file", metavar="FILE",
+        help="Text file with one discord ID per line")
+
+    parser.add_argument("--stats",  action="store_true",
                         help="Print feature and label statistics after building")
-    parser.add_argument("--limit",     type=int, default=None,
-                        help="Process only the first N files (for testing)")
-    parser.add_argument("--resume",    default=None, metavar="MANIFEST",
-                        help="Path to existing _manifest.json; skip already-processed matches")
+    parser.add_argument("--limit",  type=int, default=None,
+                        help="Process only the first N files (for quick testing)")
+    parser.add_argument("--resume", default=None, metavar="MANIFEST",
+                        help="Path to existing _manifest.json; skip already-processed games")
     args = parser.parse_args()
 
-    build_dataset(args.citf_dir, args.discord_id, args.output, args.stats,
+    if args.experts:
+        expert_ids = {int(x.strip()) for x in args.experts.split(",") if x.strip()}
+    else:
+        with open(args.experts_file) as f:
+            expert_ids = {int(line.strip()) for line in f if line.strip()}
+
+    if not expert_ids:
+        parser.error("No expert IDs provided.")
+
+    build_dataset(args.citf_dir, expert_ids, args.output, args.stats,
                   args.limit, args.resume)

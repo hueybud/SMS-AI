@@ -313,11 +313,17 @@ def compute_norm_stats(X_mm: np.ndarray, n_frames: int,
 
 def oversample_seqs(seq_starts: np.ndarray, y: np.ndarray, T: int,
                     neutral_keep: float, seed: int) -> np.ndarray:
-    """Sequence-level oversampling.
+    """Sequence-level neutral undersampling.
 
     Keep all sequences that contain ≥1 frame with any button pressed (A-R, cols 0-5)
     OR any significant c-stick deflection (cols 8-9, |val| > 0.15 — captures dekes).
     Keep neutral_keep fraction of fully-neutral sequences.
+
+    NOTE: The "action" definition here is incomplete — main stick movement (cols 6-7)
+    is not included, so sequences where the expert is only moving (no buttons, no deke)
+    are incorrectly classified as neutral.  With neutral_keep=1.0 this doesn't matter
+    since all sequences are kept regardless.  If neutral_keep < 1.0, revisit this to
+    add a main stick magnitude threshold (e.g. sqrt(sx²+sy²) > 0.3).
     """
     n = len(seq_starts)
     action_mask = np.zeros(n, dtype=bool)
@@ -374,11 +380,15 @@ def build_seg_ranges(seg: np.ndarray, end: int) -> list:
 
 def oversample_segments(seg_ranges: list, y: np.ndarray,
                         neutral_keep: float, seed: int) -> list:
-    """Segment-level oversampling.
+    """Segment-level neutral undersampling.
 
     Keeps all segments containing >=1 button press (cols 0-5) or c-stick
     deflection >0.15 (cols 8-9, deke inputs).  Keeps neutral_keep fraction
     of fully neutral segments.  Returns a sorted list of (start, end) pairs.
+
+    NOTE: Same incomplete "action" definition as oversample_seqs — main stick
+    movement is not considered.  With neutral_keep=1.0 this is a no-op.
+    If neutral_keep < 1.0, add main stick magnitude check before revisiting.
     """
     rng = np.random.default_rng(seed)
     action, neutral = [], []
@@ -873,8 +883,8 @@ if __name__ == "__main__":
                         help="Sequences per batch (default 64 → 64×64=4096 frames/step)")
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--seed",         type=int,   default=42)
-    parser.add_argument("--neutral-keep", type=float, default=0.20,
-                        help="Fraction of neutral sequences to keep (default 0.20)")
+    parser.add_argument("--neutral-keep", type=float, default=1.0,
+                        help="Fraction of neutral sequences to keep (default 1.0 = keep all)")
     parser.add_argument("--eval-every",   type=int,   default=1,
                         help="Run validation every N epochs (default 1)")
     args = parser.parse_args()

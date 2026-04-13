@@ -1,0 +1,13 @@
+numpy>=1.24
+zstandard>=0.21
+matplotlib>=3.7
+
+# PyTorch: install via https://pytorch.org/get-started/locally/ to match your CUDA version.
+# Example for CUDA 12.1:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# Example for CPU-only:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+
+# Optional: only needed for export_onnx.py and verify_chip_shots.py
+onnxruntime>=1.17
