@@ -73,6 +73,9 @@ STRIKER_STATE_IDX = {s: i for i, s in enumerate(_STRIKER_VOCAB_LIST)}
 GOALIE_STATE_IDX  = {s: i for i, s in enumerate(_GOALIE_VOCAB_LIST)}
 STRIKER_STATE_DIM = len(_STRIKER_VOCAB_LIST) + 1  # 30 (29 known + 1 other)
 GOALIE_STATE_DIM  = len(_GOALIE_VOCAB_LIST)  + 1  # 27 (26 known + 1 other)
+# v6: Action states stored as integer indices (embedded in model, not one-hot in features).
+STRIKER_OTHER_IDX = STRIKER_STATE_DIM - 1  # 29
+GOALIE_OTHER_IDX  = GOALIE_STATE_DIM  - 1  # 26
 
 # ---- Other encoding constants -----------------------------------------------
 
@@ -82,6 +85,11 @@ _SPEED_ITEM_MAP = {0: 0, 7: 1, 8: 2}
 
 POWERUP_DIM = 10    # types 0-8 plus empty(-1 → index 9)
 _POWERUP_MAP = {-1: 9, 0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8}
+
+# v6: Field item type indices (for embedding in model). 9 types + 1 padding = 10.
+FIELD_ITEM_TYPES = 10  # types 0-8 + padding index 9
+FIELD_ITEM_K     = 4   # top-K nearest items as entity tokens
+FIELD_ITEM_DIM   = 8   # per-item: type_idx(1) + pos_delta(3) + vel(3) + strength(1)
 
 PAD_A = 0x0100
 PAD_B = 0x0200
@@ -98,37 +106,52 @@ _RIGHT_STRIKER_SLOTS = [5, 6, 7, 8]
 _LEFT_GOALIE_SLOT    = 4
 _RIGHT_GOALIE_SLOT   = 9
 
-# ---- Feature / label dimensions (verified by _count_feature_dims below) ----
+# ---- Feature / label dimensions (v6) -----------------------------------------
 #
-# Ball (absolute, post-mirror):                  8
+# v6 changes from v5:
+#   - Action states: one-hot → integer index (1 float per character, embedded in model)
+#   - Ball: +3 (ball-to-goal distance/angle)
+#   - Context: -2 (removed score_diff, time_fraction), +2 (is_kickoff, goalie_has_ball)
+#   - Labels: L replaced by lob_pass (L∧A) and chip_shot (L∧B) → 7 buttons
+#   - Field items: 4 nearest items as features (K=4, 8 dims each)
+#   - prev_labels: 11 (7 buttons + 4 sticks)
+#
+# Ball (absolute, post-mirror):                 11
+#   pos(3) + vel(3) + charge(1) + perfect_pass(1) + ball_to_goal(3)
 # Ball owner one-hot (slots 0-9 + none=10):     11
-# Self character:                                48
-#   pos_delta (3) + state_oh (30) + heading (2) + goal_dist_angle (3)
-#   + effect (5) + speed_item (3) + item_timer (1) + is_ball_carrier (1)
-#   (when goalie: state_oh = goalie_state(27) + zeros(3); speed_item/timer = 0)
-# 3 other friendly strikers × 36:              108
-#   pos_delta (3) + striker_state (30) + heading (2) + is_ball_carrier (1)
-# Friendly goalie:                               30
-#   pos_delta (3) + goalie_state (27)
-# 4 enemy strikers × 36:                       144
-# Enemy goalie:                                  30
+# Self character:                                19
+#   pos_delta(3) + state_idx(1) + heading(2) + goal_dist_angle(3)
+#   + effect(5) + speed_item(3) + item_timer(1) + is_ball_carrier(1)
+#   (when goalie: state_idx uses goalie vocab; speed_item/timer = 0)
+# 3 other friendly strikers × 7:                21
+#   pos_delta(3) + state_idx(1) + heading(2) + is_ball_carrier(1)
+# Friendly goalie:                                4
+#   pos_delta(3) + state_idx(1)
+# 4 enemy strikers × 7:                         28
+# Enemy goalie:                                   4
 # Own inventory 2 slots × 11:                   22
-#   powerup_type (10) + charge_count (1)
+#   powerup_type_oh(10) + charge_count(1)
 # Enemy inventory 2 slots × 11:                 22
-# Tactical summary:                              5
+# 4 nearest field items × 8:                    32
+#   type_idx(1) + pos_delta(3) + vel(3) + strength(1)
+# Tactical summary:                               5
 #   self_dist/40 + self_rank/3 + is_nearest + nearest_enemy_dist/40 + enemy_in_path
-# Score diff + time elapsed fraction:            2
-# Possession booleans:                           2
+# Possession booleans:                            2
 #   friendly_has_ball + enemy_has_ball
-# Previous frame action (buttons + sticks):     10
-#   A, B, X, Y, L, R (0/1), stick_x, stick_y, cstick_x, cstick_y ([-1,1])
-#   Zeroed at segment boundaries (match start, phase transitions, frame gaps)
+# Phase booleans:                                 2
+#   is_kickoff + goalie_has_ball
+# Previous frame action (buttons + sticks):      11
+#   A, B, X, Y, lob_pass, chip_shot, R (0/1) + stick_x, stick_y, cstick_x, cstick_y
+#   Zeroed at segment boundaries
 # ──────────────────────────────────────────────────
-# Total:                                        442
+# Total:                                        194
 
-PREV_ACTION_DIM = 10   # previous frame's labels appended as the last block
-FEATURE_DIM     = 432 + PREV_ACTION_DIM  # 442
-LABEL_DIM       = 10
+BUTTON_DIM      = 7    # A, B, X, Y, lob_pass, chip_shot, R
+STICK_DIM       = 4    # stick_x, stick_y, cstick_x, cstick_y
+PREV_ACTION_DIM = BUTTON_DIM + STICK_DIM  # 11
+CORE_FEATURE_DIM = 183  # everything except prev_labels
+FEATURE_DIM     = CORE_FEATURE_DIM + PREV_ACTION_DIM  # 194
+LABEL_DIM       = BUTTON_DIM + STICK_DIM  # 11
 
 
 # ---- One-hot helpers ---------------------------------------------------------
@@ -148,6 +171,16 @@ def _striker_state_oh(state: int) -> List[float]:
 def _goalie_state_oh(state: int) -> List[float]:
     idx = GOALIE_STATE_IDX.get(state, len(_GOALIE_VOCAB_LIST))
     return _one_hot(idx, GOALIE_STATE_DIM)
+
+
+def _striker_state_idx(state: int) -> float:
+    """v6: Return integer index as float (embedded in model, not one-hot)."""
+    return float(STRIKER_STATE_IDX.get(state, STRIKER_OTHER_IDX))
+
+
+def _goalie_state_idx(state: int) -> float:
+    """v6: Return integer index as float (embedded in model, not one-hot)."""
+    return float(GOALIE_STATE_IDX.get(state, GOALIE_OTHER_IDX))
 
 
 def _effect_oh(effect: int) -> List[float]:
@@ -285,17 +318,16 @@ def extract_features(header: CaptureHeader,
                      subject_team: int,
                      self_slot: int,
                      is_goalie: bool) -> List[float]:
-    """Build the 430-float feature vector for one active-play frame.
+    """Build the feature vector for one active-play frame (v6).
 
-    Canonical mirror is applied when subject_team == RIGHT_TEAM:
-      - All X positions and velocities are negated
-      - Heading cosine is negated (reflects direction across Y axis)
-    After mirroring the subject team always attacks in the +X direction.
+    v6 changes from v5:
+      - Action states: integer index (1 float) instead of one-hot (27-30 floats)
+      - Ball: +3 ball-to-goal distance/angle
+      - Removed: score_diff, time_fraction
+      - Added: is_kickoff, goalie_has_ball, 4 nearest field items
+      - Labels: 7 buttons (lob_pass/chip_shot replace standalone L)
 
-    When is_goalie=True the subject controls the goalie slot (e.g. after a diving
-    save). The self-block uses a goalie-compatible encoding: goalie_state_oh(27)
-    zero-padded to 30 dims, speed_item and item_timer set to zero. All other blocks
-    (ball, teammates, enemies, inventory, tactical summary) are unchanged.
+    Canonical mirror is applied when subject_team == RIGHT_TEAM.
     """
     mirror = (subject_team == RIGHT_TEAM)
     sign   = -1.0 if mirror else 1.0
@@ -318,15 +350,20 @@ def extract_features(header: CaptureHeader,
 
     feat: List[float] = []
 
-    # --- 1. Ball (8) ---
+    # --- 1. Ball (11) ---
     feat += [bpx, bpy, bpz, bvx, bvy, bvz,
              frame.ball_charge_amount / 35.0,
              float(frame.is_perfect_pass)]
+    # Ball-to-goal geometry (v6)
+    b2g_dx   = goal_x - bpx
+    b2g_dy   = 0.0 - bpy  # goal center is at y=0
+    b2g_dist = math.sqrt(b2g_dx * b2g_dx + b2g_dy * b2g_dy) + 1e-6
+    feat += [b2g_dist / 40.0, b2g_dx / b2g_dist, b2g_dy / b2g_dist]
 
     # --- 2. Ball owner one-hot (11: slots 0-9 + none=10) ---
     feat += _one_hot(owner_slot, 11)
 
-    # --- 3. Self character (48) ---
+    # --- 3. Self character (19) ---
     sc    = frame.characters[self_slot]
     sc_px = mx(sc.pos_x)
     sc_py = sc.pos_y
@@ -339,9 +376,9 @@ def extract_features(header: CaptureHeader,
 
     feat += [sc_px - bpx, sc_py - bpy, sc.pos_z]            # Δpos to ball (3)
     if is_goalie:
-        feat += _goalie_state_oh(sc.action_state) + [0.0, 0.0, 0.0]  # state padded to 30
+        feat += [_goalie_state_idx(sc.action_state)]          # state index (1)
     else:
-        feat += _striker_state_oh(sc.action_state)            # state (30)
+        feat += [_striker_state_idx(sc.action_state)]         # state index (1)
     feat += [sin_h, cos_h]                                    # heading (2)
     feat += [dist / 40.0, dx / dist, dy / dist]               # goal dist+angle (3)
     feat += _effect_oh(sc.effect_type)                        # effect (5)
@@ -353,33 +390,30 @@ def extract_features(header: CaptureHeader,
         feat += [sc.speed_item_timer / 10.0]                  # item timer (1)
     feat += [float(self_slot == owner_slot)]                   # is ball carrier (1)
 
-    # --- 4. 3 other friendly strikers, sorted by distance to ball (36 × 3 = 108) ---
-    # When subject controls the goalie, all 4 strikers are potential pass targets.
-    # When subject controls a striker, the other 3 strikers are included.
+    # --- 4. 3 other friendly strikers, sorted by distance to ball (7 × 3 = 21) ---
     all_friendly = _striker_slots(subject_team)
     others = all_friendly if is_goalie else [s for s in all_friendly if s != self_slot]
     others = sorted(others, key=lambda s: (mx(frame.characters[s].pos_x) - bpx) ** 2
                                           + (frame.characters[s].pos_y - bpy) ** 2)
     for slot in others[:3]:
-        ch   = frame.characters[slot]
+        ch    = frame.characters[slot]
         ch_px = mx(ch.pos_x)
         sh, ch_ = _heading_sincos(ch.heading)
         if mirror:
             ch_ = -ch_
         feat += [ch_px - bpx, ch.pos_y - bpy, ch.pos_z]    # Δpos (3)
-        feat += _striker_state_oh(ch.action_state)           # state (30)
+        feat += [_striker_state_idx(ch.action_state)]        # state index (1)
         feat += [sh, ch_]                                    # heading (2)
         feat += [float(slot == owner_slot)]                  # is ball carrier (1)
-    # Defensive zero-padding (shouldn't occur with full 4-striker teams)
     for _ in range(3 - len(others[:3])):
-        feat += [0.0] * 36
+        feat += [0.0] * 7
 
-    # --- 5. Friendly goalie (16) ---
+    # --- 5. Friendly goalie (4) ---
     gs = frame.characters[_goalie_slot(subject_team)]
     feat += [mx(gs.pos_x) - bpx, gs.pos_y - bpy, gs.pos_z]  # Δpos (3)
-    feat += _goalie_state_oh(gs.action_state)                  # state (13)
+    feat += [_goalie_state_idx(gs.action_state)]               # state index (1)
 
-    # --- 6. 4 enemy strikers, sorted by distance to ball (30 × 4 = 120) ---
+    # --- 6. 4 enemy strikers, sorted by distance to ball (7 × 4 = 28) ---
     enemies = sorted(_enemy_striker_slots(subject_team),
                      key=lambda s: (mx(frame.characters[s].pos_x) - bpx) ** 2
                                    + (frame.characters[s].pos_y - bpy) ** 2)
@@ -390,14 +424,14 @@ def extract_features(header: CaptureHeader,
         if mirror:
             ch_ = -ch_
         feat += [ch_px - bpx, ch.pos_y - bpy, ch.pos_z]    # Δpos (3)
-        feat += _striker_state_oh(ch.action_state)           # state (24)
+        feat += [_striker_state_idx(ch.action_state)]        # state index (1)
         feat += [sh, ch_]                                    # heading (2)
         feat += [float(slot == owner_slot)]                  # is ball carrier (1)
 
-    # --- 7. Enemy goalie (16) ---
+    # --- 7. Enemy goalie (4) ---
     eg = frame.characters[_enemy_goalie_slot(subject_team)]
     feat += [mx(eg.pos_x) - bpx, eg.pos_y - bpy, eg.pos_z]  # Δpos (3)
-    feat += _goalie_state_oh(eg.action_state)                  # state (13)
+    feat += [_goalie_state_idx(eg.action_state)]               # state index (1)
 
     # --- 8. Own inventory (2 slots × 11 = 22) ---
     own_inv = frame.left_inventory if subject_team == LEFT_TEAM else frame.right_inventory
@@ -411,7 +445,27 @@ def extract_features(header: CaptureHeader,
         feat += _powerup_oh(slot.type)
         feat += [slot.charge_count / 5.0]
 
-    # --- 10. Tactical summary (5) ---
+    # --- 10. 4 nearest field items (8 × 4 = 32) ---
+    # Items sorted by distance to controlled character. Unused slots zero-padded.
+    items_with_dist = []
+    for item in frame.items:
+        ipx = mx(item.pos_x)
+        ipy = item.pos_y
+        d2 = (ipx - sc_px) ** 2 + (ipy - sc_py) ** 2
+        items_with_dist.append((d2, item, ipx, ipy))
+    items_with_dist.sort(key=lambda t: t[0])
+    for k in range(FIELD_ITEM_K):
+        if k < len(items_with_dist):
+            _, item, ipx, ipy = items_with_dist[k]
+            feat += [float(min(item.powerup_type, 8))]       # type index (1), clamp to 0-8
+            feat += [ipx - sc_px, ipy - sc_py, item.pos_z]      # Δpos to self (3)
+            feat += [mx(item.vel_x), item.vel_y, item.vel_z]    # velocity (3)
+            feat += [item.strength_level / 2.0]                  # strength (1)
+        else:
+            feat += [9.0]         # padding type index (indicates empty slot)
+            feat += [0.0] * 7    # zero-pad remaining dims
+
+    # --- 11. Tactical summary (5) ---
     self_dist_to_ball = math.sqrt((sc_px - bpx) ** 2 + (sc_py - bpy) ** 2)
     self_rank = sum(
         1 for s in _striker_slots(subject_team)
@@ -435,23 +489,19 @@ def extract_features(header: CaptureHeader,
     feat += [nearest_enemy_dist / 40.0]
     feat += [enemy_in_path]
 
-    # --- 11. Score + time (2) ---
-    score_diff = int(frame.left_score) - int(frame.right_score)
-    if subject_team == RIGHT_TEAM:
-        score_diff = -score_diff
-    feat += [max(-5.0, min(5.0, float(score_diff))) / 5.0]
-
-    mt = max(header.match_time_allotted, 1)
-    feat += [min(frame.game_time / mt, 1.0)]                 # elapsed fraction
-
     # --- 12. Possession booleans (2) ---
     friendly_slots = set(_LEFT_STRIKER_SLOTS + [_LEFT_GOALIE_SLOT]) if subject_team == LEFT_TEAM \
                      else set(_RIGHT_STRIKER_SLOTS + [_RIGHT_GOALIE_SLOT])
     feat += [float(owner_slot in friendly_slots)]            # friendly_has_ball
     feat += [float(owner_slot != 10 and owner_slot not in friendly_slots)]  # enemy_has_ball
 
-    assert len(feat) == 432, (
-        f"Core feature dim mismatch: got {len(feat)}, expected 432"
+    # --- 13. Phase booleans (2) ---
+    feat += [float(frame.game_phase == 1)]                   # is_kickoff
+    gk_slot = _goalie_slot(subject_team)
+    feat += [float(owner_slot == gk_slot)]                   # goalie_has_ball
+
+    assert len(feat) == CORE_FEATURE_DIM, (
+        f"Core feature dim mismatch: got {len(feat)}, expected {CORE_FEATURE_DIM}"
     )
     return feat
 
@@ -459,60 +509,73 @@ def extract_features(header: CaptureHeader,
 def extract_labels(frame: GameStateFrame,
                    subject_port: int,
                    subject_team: int) -> List[float]:
-    """Build the 10-float label vector for one frame.
+    """Build the 11-float label vector for one frame (v6).
 
-    Buttons: binary (0.0 / 1.0) for A, B, X, Y, L, R.
-    Analog:  (raw_byte - 128) / 128.0, i.e. [-1, 1].
-    Stick X is negated when the subject's team is mirrored (RIGHT_TEAM).
+    Buttons (7): A, B, X, Y, lob_pass, chip_shot, R.
+    Analog (4):  (raw_byte - 128) / 128.0, i.e. [-1, 1].
+    Stick X and C-stick X are negated when mirrored (RIGHT_TEAM).
+
+    v6 change: standalone L removed. Replaced by composite labels:
+      lob_pass  = L AND A (lob pass)
+      chip_shot = L AND B (chip shot / lob shot)
     """
     ctrl   = frame.controllers[subject_port]
     mirror = (subject_team == RIGHT_TEAM)
     btn    = ctrl.buttons
 
+    has_a = bool(btn & PAD_A)
+    has_b = bool(btn & PAD_B)
+    has_l = bool(btn & PAD_L)
+
     sx = (ctrl.stick_x - 128) / 128.0
+    cx = (ctrl.substick_x - 128) / 128.0
     if mirror:
         sx = -sx
+        cx = -cx
 
     return [
-        float(bool(btn & PAD_A)),
-        float(bool(btn & PAD_B)),
-        float(bool(btn & PAD_X)),
-        float(bool(btn & PAD_Y)),
-        float(bool(btn & PAD_L)),
-        float(bool(btn & PAD_R)),
-        sx,
-        (ctrl.stick_y    - 128) / 128.0,
-        (ctrl.substick_x - 128) / 128.0,
-        (ctrl.substick_y - 128) / 128.0,
+        float(has_a),                    # A (pass / switch)
+        float(has_b),                    # B (shoot / slide tackle)
+        float(bool(btn & PAD_X)),        # X (powerup)
+        float(bool(btn & PAD_Y)),        # Y (deke / hit)
+        float(has_l and has_a),          # lob_pass (L+A)
+        float(has_l and has_b),          # chip_shot (L+B)
+        float(bool(btn & PAD_R)),        # R (turbo / sprint)
+        sx,                              # stick_x
+        (ctrl.stick_y    - 128) / 128.0, # stick_y
+        cx,                              # cstick_x
+        (ctrl.substick_y - 128) / 128.0, # cstick_y
     ]
 
 
 # ---- Label names (for logging) ----------------------------------------------
-# Index: 0=A  1=B  2=X  3=Y  4=L  5=R  6=stick_x  7=stick_y  8=cstick_x  9=cstick_y
+# Index: 0=A  1=B  2=X  3=Y  4=lob_pass  5=chip_shot  6=R
+#        7=stick_x  8=stick_y  9=cstick_x  10=cstick_y
 # Strikers semantics:
-#   A  — pass (offense) / switch controlled character (defense)
-#   B  — shoot / charge shot (offense) / slide tackle (defense)
-#   X  — powerup usage (offense or defense)
-#   Y  — deke (offense, also available via C-stick) / hit attempt (defense)
-#   L  — modifier only: L+B = chip shot, L+A = lob pass; L alone does nothing
-#   R  — turbo / sprint (hold on offense; community theory: slight speed boost on defense)
-#   Z  — switch active item (not in labels; rarely used — add later if needed)
+#   A         — pass (offense) / switch controlled character (defense)
+#   B         — shoot / charge shot (offense) / slide tackle (defense)
+#   X         — powerup usage (offense or defense)
+#   Y         — deke (offense, also available via C-stick) / hit attempt (defense)
+#   lob_pass  — L+A: lob pass (composite label, v6)
+#   chip_shot — L+B: chip shot / lob shot (composite label, v6)
+#   R         — turbo / sprint modifier on stick (hold for speed boost)
+#   Z         — switch active item (not in labels; rarely used)
 LABEL_NAMES = [
     "A(pass/sw)", "B(shoot/sl)", "X(powerup)", "Y(deke/hit)",
-    "L(lob+chip)", "R(turbo)",
+    "lob_pass(L+A)", "chip_shot(L+B)", "R(turbo)",
     "stick_x", "stick_y", "cstick_x", "cstick_y",
 ]
 
-# Expected press-rate ranges derived from the 100-file pilot run.
-# Used to flag anomalies during the full run.
-# Format: (min_expected, max_expected) — 3× / ÷3 tolerance around pilot values.
+# Expected press-rate ranges derived from v5 data.
+# Used to flag anomalies during the build. 3× / ÷3 tolerance.
 _BTN_EXPECTED = {
-    0: (0.02, 0.20),   # A:  pilot 6.6%
-    1: (0.02, 0.20),   # B:  pilot 6.3%
-    2: (0.004, 0.04),  # X:  pilot 1.3%
-    3: (0.006, 0.06),  # Y:  pilot 2.0%
-    4: (0.003, 0.03),  # L:  pilot 1.1%
-    5: (0.15, 0.75),   # R:  pilot 46.2%
+    0: (0.02, 0.20),   # A:         v5 ~7.6%
+    1: (0.02, 0.20),   # B:         v5 ~7.9%
+    2: (0.004, 0.04),  # X:         v5 ~0.8%
+    3: (0.006, 0.06),  # Y:         v5 ~1.9%
+    4: (0.001, 0.03),  # lob_pass:  subset of L (~1.3%) ∩ A
+    5: (0.001, 0.03),  # chip_shot: subset of L (~1.3%) ∩ B
+    6: (0.15, 0.75),   # R:         v5 ~54%
 }
 
 # ---- Checkpoint helpers -----------------------------------------------------
@@ -740,7 +803,7 @@ def build_dataset(citf_dir: str, expert_ids: Set[int],
                 rates = running_y_sum / running_y_count
                 parts = []
                 flags = []
-                for i in range(6):
+                for i in range(BUTTON_DIM):
                     r = rates[i]
                     parts.append(f"{LABEL_NAMES[i]}={r:.3f}")
                     lo, hi = _BTN_EXPECTED[i]
@@ -944,17 +1007,18 @@ def _print_stats(X: "np.ndarray", y: "np.ndarray") -> None:
     print("\n--- Label statistics ---", flush=True)
     for i, name in enumerate(LABEL_NAMES):
         col = y[:, i]
-        if i < 6:
-            print(f"  {name:<16s}  press_rate={col.mean():.4f}  "
+        if i < BUTTON_DIM:
+            print(f"  {name:<18s}  press_rate={col.mean():.4f}  "
                   f"({int(col.sum()):,} / {len(col):,} frames)", flush=True)
         else:
-            print(f"  {name:<16s}  mean={col.mean():.3f}  std={col.std():.3f}  "
+            print(f"  {name:<18s}  mean={col.mean():.3f}  std={col.std():.3f}  "
                   f"range=[{col.min():.3f}, {col.max():.3f}]", flush=True)
 
-    print("\n--- Feature statistics (ball block: dims 0-7) ---", flush=True)
+    print("\n--- Feature statistics (ball block: dims 0-10) ---", flush=True)
     ball_names = ["ball_pos_x", "ball_pos_y", "ball_pos_z",
                   "ball_vel_x", "ball_vel_y", "ball_vel_z",
-                  "charge/35", "perfect_pass"]
+                  "charge/35", "perfect_pass",
+                  "b2g_dist/40", "b2g_dx_norm", "b2g_dy_norm"]
     for i, name in enumerate(ball_names):
         col = X[:, i]
         print(f"  [{i:3d}] {name:<14s}  mean={col.mean():.3f}  "

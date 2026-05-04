@@ -1,51 +1,57 @@
 #!/usr/bin/env python3
-"""train_transformer.py — Behavioral cloning transformer for Citrus Strikers.
+"""train_transformer.py — Behavioral cloning transformer for Citrus Strikers (v6).
 
 Architecture:
-  EntityEncoder (2L, 256d, 4h):           per-frame spatial attention over 16 entity tokens
-  CausalTemporalTransformer (3L, 512d, 4h): causal attention over T=64 frame window
-  ARControllerHead:                        autoregressive buttons→stick-bins output
-  Total: ~7.55M parameters
+  EntityEncoder (2L, 256d, 4h):             per-frame spatial attention over 20 entity tokens
+                                            with learned action-state embeddings
+  CausalTemporalTransformer (3L, 512d, 4h): causal attention over T=128 frame window
+  ConditionalControllerHead:                buttons (independent) → sticks (conditioned on buttons)
+  Focal loss for buttons, weighted CE for sticks
 
-Key differences from train.py (LSTM):
-  - No TBPTT: sequences are independent; PyTorch DataLoader handles batching
-  - Both X and y opened as numpy memmaps so datasets exceeding RAM are supported
-  - Flat 440-float vectors sliced into 16 entity tokens at batch time (on GPU)
-  - No LSTM h/c state — KV cache is ONNX inference-only (see forward_infer)
-  - AMP (bf16/fp16) training for GPU throughput
-  - AdamW + cosine LR with linear warmup
+v6 changes from v5:
+  - Action states: one-hot (30/27 dims) → integer index + learned embedding (8 dims)
+  - Composite lob labels: L removed, lob_pass (L+A) and chip_shot (L+B) added → 7 buttons
+  - Conditional stick heads: sticks conditioned on button probabilities
+  - Focal loss replaces pos_weight BCE for buttons
+  - Rare-action sequence oversampling (X, lob_pass, chip_shot, Y, c-stick deke)
+  - Kickoff-containing sequences force-included in training
+  - Active field items as 4 entity tokens (top-K nearest)
+  - Ball-to-goal geometry features
+  - Removed: score_diff, time_fraction
+  - Added: is_kickoff, goalie_has_ball booleans
+  - prev_labels re-enabled (no longer zeroed)
+  - SEQ_LEN=128, full checkpointing
 
 Requires PyTorch >= 2.0 (F.scaled_dot_product_attention with is_causal=True).
 
 Usage:
     python train_transformer.py <X.npy> <y.npy> <ms.npy> <seg.npy> <out_dir>
     python train_transformer.py <X.npy> <y.npy> <ms.npy> <seg.npy> <out_dir> \\
-        --epochs 20 --batch 256 --amp --workers 4
+        --epochs 20 --batch 256 --workers 4
 
-Entity token layout (16 tokens, ENTITY_RAW_DIM=64):
-    Derived from build_dataset.py feature layout — must stay in sync.
-    Token  Slice      Raw dim  Entity type
-     0     [0:19]       19     ball: pos(3)+vel(3)+charge(1)+perfect_pass(1)+owner_oh(11)
-     1     [19:67]      48     self character
-     2     [67:103]     36     friendly striker 0
-     3     [103:139]    36     friendly striker 1
-     4     [139:175]    36     friendly striker 2
-     5     [175:205]    30     friendly goalie
-     6     [205:241]    36     enemy striker 0
-     7     [241:277]    36     enemy striker 1
-     8     [277:313]    36     enemy striker 2
-     9     [313:349]    36     enemy striker 3
-    10     [349:379]    30     enemy goalie
-    11     [379:390]    11     own inventory slot 0
-    12     [390:401]    11     own inventory slot 1
-    13     [401:412]    11     enemy inventory slot 0
-    14     [412:423]    11     enemy inventory slot 1
-    15     [423:442]    19     context: tactical(5)+score/time(2)+possession(2)+prev_action(10)
-
-ONNX inference interface (export_onnx_transformer.py — separate script):
-    inputs:  entities [1,16,64], kv_cache [3,2,1,63,512]
-    outputs: btn_probs [1,6], stk_bins [1,4], kv_cache_out [3,2,1,63,512]
-    AIController.cpp: replace h/c with kv_cache; call flat_to_entities C++ port.
+Entity token layout (20 tokens, ENTITY_RAW_DIM=32):
+    Derived from build_dataset.py v6 feature layout — must stay in sync.
+    Token  Slice       Raw dim  Entity type   Notes
+     0     [0:22]        22     ball          pos(3)+vel(3)+charge+pp+b2g(3)+owner_oh(11)
+     1     [22:41]       19     self          pos_delta(3)+state_idx(1)+heading(2)+goal(3)+effect(5)+speed(3)+timer+carrier
+     2     [41:48]        7     friend str 0  pos_delta(3)+state_idx(1)+heading(2)+carrier
+     3     [48:55]        7     friend str 1
+     4     [55:62]        7     friend str 2
+     5     [62:66]        4     friend goalie pos_delta(3)+state_idx(1)
+     6     [66:73]        7     enemy str 0
+     7     [73:80]        7     enemy str 1
+     8     [80:87]        7     enemy str 2
+     9     [87:94]        7     enemy str 3
+    10     [94:98]        4     enemy goalie
+    11     [98:109]      11     own inv 0     powerup_oh(10)+charge(1)
+    12     [109:120]     11     own inv 1
+    13     [120:131]     11     enemy inv 0
+    14     [131:142]     11     enemy inv 1
+    15     [142:150]      8     field item 0  type_idx(1)+pos_delta(3)+vel(3)+strength(1)
+    16     [150:158]      8     field item 1
+    17     [158:166]      8     field item 2
+    18     [166:174]      8     field item 3
+    19     [174:194]     20     context       tactical(5)+possession(2)+phase(2)+prev_action(11)
 """
 
 from __future__ import annotations
@@ -64,17 +70,69 @@ from torch.utils.data import DataLoader, Dataset
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-SEQ_LEN     = 64      # frames per training sequence (~1 s at 60fps)
-FEATURE_DIM = 442     # flat features per frame (must match build_dataset.py)
-BUTTON_DIM      = 6       # labels 0-5: A, B, X, Y, L, R
-STICK_DIM       = 4       # labels 6-9: stick_x, stick_y, cstick_x, cstick_y
+SEQ_LEN     = 128     # frames per training sequence (~2.1 s at 60fps)
+FEATURE_DIM = 194     # flat features per frame (must match build_dataset.py v6)
+BUTTON_DIM      = 7       # labels 0-6: A, B, X, Y, lob_pass, chip_shot, R
+STICK_DIM       = 4       # labels 7-10: stick_x, stick_y, cstick_x, cstick_y
 LABEL_DIM       = BUTTON_DIM + STICK_DIM
 STICK_BINS      = 21      # discrete stick bins per axis [-1,1] → 0..20
-PREV_ACTION_DIM = 10      # last 10 features are prev-frame labels (zeroed at train+infer)
+PREV_ACTION_DIM = LABEL_DIM  # last 11 features are prev-frame labels (re-enabled in v6)
+PREV_ACTION_OFFSET = 183     # flat feature index where prev_action starts (174+5+2+2)
 
-ENTITY_RAW_DIM  = 64   # zero-padded token width fed into EntityEncoder
-N_ENTITY_TYPES  = 9    # ball / self / fr_str / fr_gk / en_str / en_gk / inv_own / inv_enemy / ctx
-N_ENTITIES      = 16
+# ── Action vocabulary (replaces independent sigmoid buttons) ──────────────────
+# Each row maps an action index to 7 binary button flags [A B X Y lob chip R].
+NUM_ACTIONS = 12
+ACTION_VOCAB = torch.tensor([
+    # A  B  X  Y  lob chip R
+    [0, 0, 0, 0, 0, 0, 0],   #  0: (none)
+    [0, 0, 0, 0, 0, 0, 1],   #  1: R
+    [1, 0, 0, 0, 0, 0, 0],   #  2: A
+    [1, 0, 0, 0, 0, 0, 1],   #  3: A+R
+    [0, 1, 0, 0, 0, 0, 0],   #  4: B
+    [0, 1, 0, 0, 0, 0, 1],   #  5: B+R
+    [0, 0, 0, 1, 0, 0, 0],   #  6: Y
+    [0, 0, 0, 1, 0, 0, 1],   #  7: Y+R
+    [0, 0, 1, 0, 0, 0, 0],   #  8: X
+    [0, 0, 1, 0, 0, 0, 1],   #  9: X+R
+    [1, 0, 0, 0, 1, 0, 0],   # 10: L+A (lob pass)
+    [0, 1, 0, 0, 0, 1, 0],   # 11: L+B (chip shot)
+], dtype=torch.float32)
+ACTION_NAMES = [
+    "(none)", "R", "A", "A+R", "B", "B+R",
+    "Y", "Y+R", "X", "X+R", "L+A", "L+B",
+]
+
+# Build a 128-entry lookup table: 7-bit button key → action index (0 for unlisted).
+# This allows GPU-vectorized O(1) conversion from 7 binary labels to action indices.
+_ACTION_KEY_TO_IDX = torch.zeros(128, dtype=torch.long)
+for _i, _row in enumerate(ACTION_VOCAB):
+    _key = int(sum(int(b) << j for j, b in enumerate(_row.tolist())))
+    _ACTION_KEY_TO_IDX[_key] = _i
+
+
+def labels_to_action_idx(btn_labels: torch.Tensor) -> torch.Tensor:
+    """Convert binary button labels [..., 7] to action indices [...].
+
+    Uses a 128-entry lookup table indexed by a 7-bit key.
+    Unlisted combos map to action 0 (none).
+    """
+    bits = (btn_labels > 0.5).long()
+    keys = torch.zeros(bits.shape[:-1], dtype=torch.long, device=bits.device)
+    for j in range(BUTTON_DIM):
+        keys = keys + (bits[..., j] << j)
+    lut = _ACTION_KEY_TO_IDX.to(bits.device)
+    return lut[keys]
+
+ENTITY_RAW_DIM  = 32   # zero-padded token width fed into EntityEncoder
+N_ENTITY_TYPES  = 11   # ball / self / fr_str / fr_gk / en_str / en_gk / inv_own / inv_enemy / field_item / ctx / (reserved)
+N_ENTITIES      = 20
+
+# Action state embedding dims (states stored as integer indices in features)
+STRIKER_STATE_VOCAB = 30   # 29 known + 1 other
+GOALIE_STATE_VOCAB  = 27   # 26 known + 1 other
+STATE_EMBED_DIM     = 8    # learned embedding dimension per state
+FIELD_ITEM_VOCAB    = 10   # 9 powerup types + 1 padding
+ITEM_EMBED_DIM      = 4    # learned embedding dimension per item type
 
 ENTITY_DIM      = 256  # EntityEncoder hidden dim
 ENTITY_LAYERS   = 2
@@ -85,36 +143,41 @@ TEMPORAL_LAYERS = 3
 TEMPORAL_HEADS  = 4
 FF_MULT         = 2
 
-BUTTON_NAMES = ["A", "B", "X", "Y", "L", "R"]
+BUTTON_NAMES = ["A", "B", "X", "Y", "lob_pass", "chip_shot", "R"]
 STICK_NAMES  = ["stick_x", "stick_y", "cstick_x", "cstick_y"]
 
-F1_TARGETS       = {"A": 0.45, "B": 0.55, "X": 0.40, "Y": 0.35, "L": 0.30, "R": 0.50}
+F1_TARGETS       = {"A": 0.45, "B": 0.55, "X": 0.30, "Y": 0.30,
+                     "lob_pass": 0.20, "chip_shot": 0.20, "R": 0.50}
 STICK_ERR_TARGET = 25.0
 IDLE_ACC_TARGET  = 0.90
 
-# ── Entity token layout ───────────────────────────────────────────────────────
+# ── Entity token layout (v6) ──────────────────────────────────────────────────
 # (slice_start, slice_end_exclusive, entity_type_id)
-# Slice offsets derived from build_dataset.py feature layout comment block.
-# If FEATURE_DIM changes (e.g. remove game_time, add attacking bools → 441),
-# update the slices here to match and set FEATURE_DIM accordingly.
+# Slice offsets derived from build_dataset.py v6 feature layout.
+# Action states are stored as single float (integer index) — the model's
+# EntityEncoder embeds them via nn.Embedding.
 
 _ENTITY_DEFS: List[Tuple[int, int, int]] = [
-    (  0,  19, 0),  # ball: pos×3 vel×3 charge perfect_pass + owner_oh×11
-    ( 19,  67, 1),  # self: pos_delta×3 state_oh×30 heading×2 goal×3 effect×5 spd×3 timer carrier
-    ( 67, 103, 2),  # friendly striker 0: pos_delta×3 state_oh×30 heading×2 carrier
-    (103, 139, 2),  # friendly striker 1
-    (139, 175, 2),  # friendly striker 2
-    (175, 205, 3),  # friendly goalie: pos_delta×3 goalie_state_oh×27
-    (205, 241, 4),  # enemy striker 0
-    (241, 277, 4),  # enemy striker 1
-    (277, 313, 4),  # enemy striker 2
-    (313, 349, 4),  # enemy striker 3
-    (349, 379, 5),  # enemy goalie
-    (379, 390, 6),  # own inventory 0: powerup_oh×10 charge
-    (390, 401, 6),  # own inventory 1
-    (401, 412, 7),  # enemy inventory 0
-    (412, 423, 7),  # enemy inventory 1
-    (423, 442, 8),  # context: tactical×5 score_diff time possession×2 prev_action×10
+    (  0,  22, 0),  # ball: pos×3 vel×3 charge pp b2g×3 + owner_oh×11
+    ( 22,  41, 1),  # self: pos_delta×3 state_idx×1 heading×2 goal×3 effect×5 spd×3 timer carrier
+    ( 41,  48, 2),  # friendly striker 0: pos_delta×3 state_idx×1 heading×2 carrier
+    ( 48,  55, 2),  # friendly striker 1
+    ( 55,  62, 2),  # friendly striker 2
+    ( 62,  66, 3),  # friendly goalie: pos_delta×3 state_idx×1
+    ( 66,  73, 4),  # enemy striker 0
+    ( 73,  80, 4),  # enemy striker 1
+    ( 80,  87, 4),  # enemy striker 2
+    ( 87,  94, 4),  # enemy striker 3
+    ( 94,  98, 5),  # enemy goalie
+    ( 98, 109, 6),  # own inventory 0: powerup_oh×10 charge
+    (109, 120, 6),  # own inventory 1
+    (120, 131, 7),  # enemy inventory 0
+    (131, 142, 7),  # enemy inventory 1
+    (142, 150, 8),  # field item 0: type_idx×1 pos_delta×3 vel×3 strength×1
+    (150, 158, 8),  # field item 1
+    (158, 166, 8),  # field item 2
+    (166, 174, 8),  # field item 3
+    (174, 194, 9),  # context: tactical×5 possession×2 phase×2 prev_action×11
 ]
 
 assert len(_ENTITY_DEFS) == N_ENTITIES, "N_ENTITIES mismatch"
@@ -123,7 +186,15 @@ assert all(0 <= s and e <= FEATURE_DIM and (e - s) <= ENTITY_RAW_DIM
 assert sum(e - s for s, e, _ in _ENTITY_DEFS) == FEATURE_DIM, (
     f"Entity slices do not cover all {FEATURE_DIM} features")
 
-_ENTITY_TYPE_IDS = [t for _, _, t in _ENTITY_DEFS]   # [16] — used in EntityEncoder
+_ENTITY_TYPE_IDS = [t for _, _, t in _ENTITY_DEFS]   # [20] — used in EntityEncoder
+
+# Offsets within entity tokens where the action state index lives.
+# Used by EntityEncoder to extract, embed, and replace the integer index.
+# These are relative to the token's raw dims (after slicing from flat features).
+_SELF_STATE_IDX_OFFSET    = 3   # self token: [pos_delta×3, STATE_IDX, ...]
+_STRIKER_STATE_IDX_OFFSET = 3   # friendly/enemy striker tokens: [pos_delta×3, STATE_IDX, ...]
+_GOALIE_STATE_IDX_OFFSET  = 3   # goalie tokens: [pos_delta×3, STATE_IDX]
+_ITEM_TYPE_IDX_OFFSET     = 0   # field item tokens: [TYPE_IDX, pos_delta×3, vel×3, strength]
 
 
 # ── Discretisation helpers ─────────────────────────────────────────────────────
@@ -191,19 +262,35 @@ class EntityTransformerLayer(nn.Module):
 
 
 class EntityEncoder(nn.Module):
-    """Per-frame spatial encoder: entity tokens → single frame embedding.
+    """Per-frame spatial encoder: entity tokens → single frame embedding (v6).
 
     Input:  [B, N_ENTITIES, ENTITY_RAW_DIM]
     Output: [B, TEMPORAL_DIM]
 
+    v6: Action states and field item types are stored as integer indices in the
+    feature vector. This encoder extracts them, looks up learned embeddings,
+    and concatenates them with the remaining continuous features before projection.
+
     A learned entity-type embedding is added after projection so the model
-    learns to distinguish ball / strikers / goalies / inventory / context
-    without relying solely on their positional order.
+    learns to distinguish ball / strikers / goalies / inventory / items / context.
     """
 
     def __init__(self):
         super().__init__()
-        self.proj       = nn.Linear(ENTITY_RAW_DIM, ENTITY_DIM)
+        # Action state embeddings (shared across all characters of same type)
+        self.striker_state_embed = nn.Embedding(STRIKER_STATE_VOCAB, STATE_EMBED_DIM)
+        self.goalie_state_embed  = nn.Embedding(GOALIE_STATE_VOCAB,  STATE_EMBED_DIM)
+        self.item_type_embed     = nn.Embedding(FIELD_ITEM_VOCAB,    ITEM_EMBED_DIM)
+
+        # After embedding replacement, the effective token width changes:
+        # - Self token: 19 raw → 18 continuous + STATE_EMBED_DIM(8) = 26
+        # - Striker token: 7 raw → 6 continuous + STATE_EMBED_DIM(8) = 14
+        # - Goalie token: 4 raw → 3 continuous + STATE_EMBED_DIM(8) = 11
+        # - Item token: 8 raw → 7 continuous + ITEM_EMBED_DIM(4) = 11
+        # - Others unchanged (ball=22, inv=11, context=20)
+        # Max effective width = 26 (self). Project from padded max.
+        self._effective_max = ENTITY_RAW_DIM + STATE_EMBED_DIM  # generous upper bound
+        self.proj       = nn.Linear(self._effective_max, ENTITY_DIM)
         self.type_embed = nn.Embedding(N_ENTITY_TYPES, ENTITY_DIM)
         self.layers     = nn.ModuleList([
             EntityTransformerLayer(ENTITY_DIM, ENTITY_HEADS)
@@ -214,8 +301,48 @@ class EntityEncoder(nn.Module):
         type_ids = torch.tensor(_ENTITY_TYPE_IDS, dtype=torch.long)
         self.register_buffer("type_ids", type_ids)  # [N_ENTITIES]
 
+    def _embed_state(self, token: torch.Tensor, idx_offset: int,
+                     embed: nn.Embedding) -> torch.Tensor:
+        """Extract integer index at idx_offset, look up embedding, replace it.
+
+        token: [B, raw_dim]
+        Returns: [B, raw_dim - 1 + embed_dim]  (index removed, embedding inserted)
+        """
+        idx = token[:, idx_offset].long().clamp(0, embed.num_embeddings - 1)
+        emb = embed(idx)  # [B, embed_dim]
+        before = token[:, :idx_offset]
+        after  = token[:, idx_offset + 1:]
+        return torch.cat([before, emb, after], dim=-1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N, raw_dim]
+        # x: [B, N, raw_dim] — zero-padded entity tokens
+        B, N, _ = x.shape
+
+        # Process each entity token: extract index, embed, pad to uniform width
+        processed = []
+        for i, (s, e, etype) in enumerate(_ENTITY_DEFS):
+            token = x[:, i, :e - s]  # [B, token_raw_dim]
+
+            if etype == 1:  # self (striker or goalie state at offset 3)
+                token = self._embed_state(token, _SELF_STATE_IDX_OFFSET,
+                                           self.striker_state_embed)
+            elif etype == 2 or etype == 4:  # friendly/enemy striker
+                token = self._embed_state(token, _STRIKER_STATE_IDX_OFFSET,
+                                           self.striker_state_embed)
+            elif etype == 3 or etype == 5:  # friendly/enemy goalie
+                token = self._embed_state(token, _GOALIE_STATE_IDX_OFFSET,
+                                           self.goalie_state_embed)
+            elif etype == 8:  # field item
+                token = self._embed_state(token, _ITEM_TYPE_IDX_OFFSET,
+                                           self.item_type_embed)
+
+            # Pad to uniform width for the linear projection
+            if token.shape[1] < self._effective_max:
+                pad = token.new_zeros(B, self._effective_max - token.shape[1])
+                token = torch.cat([token, pad], dim=1)
+            processed.append(token)
+
+        x = torch.stack(processed, dim=1)  # [B, N, effective_max]
         x = self.proj(x) + self.type_embed(self.type_ids)  # [B, N, entity_dim]
         for layer in self.layers:
             x = layer(x)
@@ -328,48 +455,59 @@ class CausalTemporalTransformer(nn.Module):
         return x.squeeze(1), torch.stack(new_kv, dim=0)        # [B,D], [L,2,B,S,D]
 
 
-class IndependentControllerHead(nn.Module):
-    """Independent controller head — all outputs predicted directly from policy.
+class ConditionalControllerHead(nn.Module):
+    """Conditional controller head — sticks conditioned on action probabilities.
 
-    Each button and each stick axis is predicted independently with a single
-    linear layer.  No autoregressive conditioning between outputs, so there is
-    no teacher-forcing gap at inference time.
+    Actions are predicted as a single categorical over NUM_ACTIONS valid button
+    combos.  Stick axes are predicted from the policy embedding concatenated
+    with softmax(action_logits), so the stick head knows which action is active
+    (e.g. R=sprint changes stick meaning, lob/chip affect aim direction).
+
+    Always uses softmax(action_logits) as conditioning in both training and
+    inference — no teacher-forcing gap.
     """
 
     def __init__(self, input_dim: int, stick_bins: int = STICK_BINS):
         super().__init__()
         self.stick_bins = stick_bins
-        self.btn_head   = nn.Linear(input_dim, BUTTON_DIM)
-        self.stk_heads  = nn.ModuleList([nn.Linear(input_dim, stick_bins) for _ in range(STICK_DIM)])
+        self.action_head = nn.Linear(input_dim, NUM_ACTIONS)
+        # Stick heads receive policy + action probabilities
+        stk_input_dim    = input_dim + NUM_ACTIONS
+        self.stk_heads   = nn.ModuleList([nn.Linear(stk_input_dim, stick_bins)
+                                           for _ in range(STICK_DIM)])
 
     def forward_train(self,
                       policy: torch.Tensor,
                       btn_targets: torch.Tensor,
                       stk_targets: torch.Tensor):
-        """Training forward (btn_targets/stk_targets unused — kept for API compatibility).
+        """Training forward.
 
         policy: [B, T, input_dim]
         Returns:
-            btn_logits: [B, T, BUTTON_DIM]
+            action_logits: [B, T, NUM_ACTIONS]
             stk_logits: list of STICK_DIM tensors, each [B, T, STICK_BINS]
         """
-        btn_logits = self.btn_head(policy)  # [B, T, BUTTON_DIM]
-        stk_logits = [self.stk_heads[i](policy) for i in range(STICK_DIM)]
-        return btn_logits, stk_logits
+        action_logits = self.action_head(policy)                      # [B, T, NUM_ACTIONS]
+        action_probs  = torch.softmax(action_logits, dim=-1)          # [B, T, NUM_ACTIONS]
+        stk_input     = torch.cat([policy, action_probs], dim=-1)     # [B, T, input_dim + NUM_ACTIONS]
+        stk_logits    = [self.stk_heads[i](stk_input) for i in range(STICK_DIM)]
+        return action_logits, stk_logits
 
     def forward_infer(self, policy_t: torch.Tensor):
-        """Inference forward — identical computation to forward_train, no gap.
+        """Inference forward — same computation as training, zero gap.
 
         policy_t: [B, input_dim]
         Returns:
-            btn_probs [B, BUTTON_DIM] — sigmoid probabilities
-            stk_bins  [B, STICK_DIM] — argmax bin per axis
+            action_idx [B] — sampled action index
+            stk_bins   [B, STICK_DIM] — argmax bin per axis
         """
-        btn_probs = torch.sigmoid(self.btn_head(policy_t))  # [B, BUTTON_DIM]
-        stk_bins  = torch.stack(
-            [self.stk_heads[i](policy_t).argmax(dim=-1) for i in range(STICK_DIM)],
+        action_logits = self.action_head(policy_t)                    # [B, NUM_ACTIONS]
+        action_probs  = torch.softmax(action_logits, dim=-1)          # [B, NUM_ACTIONS]
+        stk_input     = torch.cat([policy_t, action_probs], dim=-1)   # [B, input_dim + NUM_ACTIONS]
+        stk_bins      = torch.stack(
+            [self.stk_heads[i](stk_input).argmax(dim=-1) for i in range(STICK_DIM)],
             dim=-1)  # [B, STICK_DIM]
-        return btn_probs, stk_bins
+        return action_logits.argmax(dim=-1), stk_bins
 
 
 class CitrusTransformerBC(nn.Module):
@@ -383,7 +521,7 @@ class CitrusTransformerBC(nn.Module):
         super().__init__()
         self.entity_encoder = EntityEncoder()
         self.temporal       = CausalTemporalTransformer()
-        self.ctrl_head      = IndependentControllerHead(TEMPORAL_DIM)
+        self.ctrl_head      = ConditionalControllerHead(TEMPORAL_DIM)
         self.value_head     = nn.Linear(TEMPORAL_DIM, 1)  # reserved for future RL/PPO
 
     def forward(self,
@@ -393,9 +531,9 @@ class CitrusTransformerBC(nn.Module):
         """Training forward.
 
         x:           [B, T, FEATURE_DIM]
-        btn_targets: [B, T, BUTTON_DIM] float
-        stk_targets: [B, T, STICK_DIM]  int64
-        Returns: btn_logits [B,T,6], stk_logits list[B,T,21], value [B,T,1]
+        btn_targets: [B, T, BUTTON_DIM] float  (unused by ctrl_head, kept for API compat)
+        stk_targets: [B, T, STICK_DIM]  int64  (unused by ctrl_head, kept for API compat)
+        Returns: action_logits [B,T,NUM_ACTIONS], stk_logits list[B,T,21], value [B,T,1]
         """
         B, T, _ = x.shape
         entities  = flat_to_entities(x)                           # [B, T, N, raw]
@@ -404,8 +542,8 @@ class CitrusTransformerBC(nn.Module):
         frame_emb = frame_emb.view(B, T, TEMPORAL_DIM)            # [B, T, D]
         temporal  = self.temporal(frame_emb)                       # [B, T, D]
         value     = self.value_head(temporal)                      # [B, T, 1]
-        btn_logits, stk_logits = self.ctrl_head.forward_train(temporal, btn_targets, stk_targets)
-        return btn_logits, stk_logits, value
+        action_logits, stk_logits = self.ctrl_head.forward_train(temporal, btn_targets, stk_targets)
+        return action_logits, stk_logits, value
 
     def forward_infer(self,
                       entities: torch.Tensor,
@@ -415,14 +553,14 @@ class CitrusTransformerBC(nn.Module):
         entities:  [1, N_ENTITIES, ENTITY_RAW_DIM]
         kv_cache:  [TEMPORAL_LAYERS, 2, 1, SEQ_LEN-1, TEMPORAL_DIM]
         Returns:
-            btn_probs    [1, BUTTON_DIM]         — sigmoid probabilities
+            action_idx   [1]                     — sampled action index
             stk_bins     [1, STICK_DIM]          — argmax bin indices (int64)
             kv_cache_out [TEMPORAL_LAYERS, 2, 1, SEQ_LEN-1, TEMPORAL_DIM]
         """
-        frame_emb           = self.entity_encoder(entities)          # [1, D]
-        out, kv_cache_out   = self.temporal.forward_cached(frame_emb, kv_cache)
-        btn_probs, stk_bins = self.ctrl_head.forward_infer(out)
-        return btn_probs, stk_bins, kv_cache_out
+        frame_emb             = self.entity_encoder(entities)          # [1, D]
+        out, kv_cache_out     = self.temporal.forward_cached(frame_emb, kv_cache)
+        action_idx, stk_bins  = self.ctrl_head.forward_infer(out)
+        return action_idx, stk_bins, kv_cache_out
 
 
 def count_params(model: nn.Module) -> int:
@@ -665,6 +803,162 @@ def compute_stick_bin_weights(y_path: str, train_end: int,
     return torch.tensor(weights, dtype=torch.float32)  # [STICK_DIM, STICK_BINS]
 
 
+# ── Focal loss ────────────────────────────────────────────────────────────────
+
+class FocalBCEWithLogitsLoss(nn.Module):
+    """Focal loss for binary classification (replaces BCEWithLogitsLoss + pos_weight).
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    where p_t = sigmoid(logit) if target=1, else 1-sigmoid(logit).
+    alpha is per-button (inverse frequency), gamma controls focus on hard examples.
+    No manual pos_weight cap needed — the (1-p_t)^gamma term self-regulates.
+    """
+
+    def __init__(self, alpha: torch.Tensor, gamma: float = 2.0):
+        super().__init__()
+        self.register_buffer("alpha", alpha)  # [BUTTON_DIM]
+        self.gamma = gamma
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # logits, targets: [N, BUTTON_DIM]
+        p = torch.sigmoid(logits)
+        # Binary cross-entropy (numerically stable via logsigmoid)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        # p_t = probability of the true class
+        p_t = p * targets + (1 - p) * (1 - targets)
+        # alpha_t: alpha for positive, (1 - alpha) for negative
+        # For rare buttons alpha is high, so false negatives get large weight.
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        focal_weight = alpha_t * (1 - p_t) ** self.gamma
+        return (focal_weight * bce).mean()
+
+
+def compute_focal_alpha(y_path: str, train_end: int,
+                        chunk: int = 1_000_000) -> torch.Tensor:
+    """Compute per-button alpha for focal loss from training label frequencies.
+
+    alpha_i = 1 - rate_i  (inverse frequency, no cap needed with focal loss).
+    """
+    y    = np.lib.format.open_memmap(y_path, mode="r")
+    sums = np.zeros(BUTTON_DIM, dtype=np.float64)
+    pos  = 0
+    while pos < train_end:
+        end   = min(pos + chunk, train_end)
+        sums += (y[pos:end, :BUTTON_DIM] > 0.5).sum(axis=0)
+        pos   = end
+    rates = sums / train_end
+    alpha = np.clip(1.0 - rates, 0.1, 0.99)  # keep in [0.1, 0.99]
+
+    print("Button press rates and focal alpha:")
+    for name, r, a in zip(BUTTON_NAMES, rates, alpha):
+        print(f"  {name:<12s}  rate={r:.4f}  alpha={a:.4f}")
+    return torch.tensor(alpha, dtype=torch.float32)
+
+
+def compute_action_weights(y_path: str, train_end: int,
+                           chunk: int = 1_000_000) -> torch.Tensor:
+    """Compute per-action class weights for CrossEntropyLoss.
+
+    Uses sqrt(1/freq) to avoid over-weighting extremely rare classes.
+    Returns: [NUM_ACTIONS] float32 tensor.
+    """
+    y = np.lib.format.open_memmap(y_path, mode="r")
+    counts = np.zeros(NUM_ACTIONS, dtype=np.float64)
+    pos = 0
+    while pos < train_end:
+        end = min(pos + chunk, train_end)
+        btns = torch.from_numpy((y[pos:end, :BUTTON_DIM] > 0.5).astype(np.float32))
+        idxs = labels_to_action_idx(btns).numpy()
+        for i in range(NUM_ACTIONS):
+            counts[i] += (idxs == i).sum()
+        pos = end
+    freqs = counts / counts.sum()
+    freqs = np.maximum(freqs, 1e-8)  # avoid div-by-zero for unused classes
+    weights = np.sqrt(1.0 / freqs)
+    weights /= weights.mean()  # normalize so mean weight = 1
+
+    print("Action vocabulary weights:")
+    for name, c, f, w in zip(ACTION_NAMES, counts, freqs, weights):
+        print(f"  {name:<12s}  count={int(c):>12,}  freq={f:.4f}  weight={w:.4f}")
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+# ── Rare-action oversampling ─────────────────────────────────────────────────
+
+def oversample_rare_actions(seq_starts: np.ndarray,
+                             y_path: str,
+                             T: int,
+                             seed: int) -> np.ndarray:
+    """Duplicate sequences containing rare actions to improve representation.
+
+    Duplication rates derived from v5 button press rates relative to A/B (~8%):
+      X (item use):             4x duplication
+      lob_pass (L+A):           4x duplication
+      chip_shot (L+B):          4x duplication
+      Y:                        3x duplication
+      c-stick deke:             4x duplication
+
+    Also force-includes sequences overlapping kickoff phase. Since gamePhase
+    is not in y, kickoff detection relies on the is_kickoff feature in X
+    (which must be checked separately via oversample_kickoff_seqs).
+    """
+    y = np.lib.format.open_memmap(y_path, mode="r")
+
+    # Scan each sequence's labels for rare actions
+    # Button indices: 0=A, 1=B, 2=X, 3=Y, 4=lob_pass, 5=chip_shot, 6=R
+    # Stick indices (in label): 7=sx, 8=sy, 9=cx, 10=cy
+    rare_dups = []
+    for start in seq_starts:
+        end = start + T
+        labels = y[start:end]
+        max_dup = 1  # default: no duplication
+
+        # Check buttons
+        if np.any(labels[:, 2] > 0.5):  # X (item use)
+            max_dup = max(max_dup, 4)
+        if np.any(labels[:, 4] > 0.5):  # lob_pass
+            max_dup = max(max_dup, 4)
+        if np.any(labels[:, 5] > 0.5):  # chip_shot
+            max_dup = max(max_dup, 4)
+        if np.any(labels[:, 3] > 0.5):  # Y
+            max_dup = max(max_dup, 3)
+
+        # Check c-stick deke (any non-neutral c-stick deflection)
+        if np.any(np.abs(labels[:, 9]) > 0.15) or np.any(np.abs(labels[:, 10]) > 0.15):
+            max_dup = max(max_dup, 4)
+
+        rare_dups.append(max_dup)
+
+    # Build duplicated index array
+    result = []
+    for start, dup in zip(seq_starts, rare_dups):
+        result.extend([start] * dup)
+
+    print(f"  Rare-action oversampling: {len(seq_starts):,} → {len(result):,} sequences "
+          f"({len(result)/len(seq_starts):.2f}x)")
+    return np.array(result, dtype=np.int64)
+
+
+def oversample_kickoff_seqs(seq_starts: np.ndarray,
+                             x_path: str,
+                             T: int,
+                             kickoff_feat_offset: int) -> np.ndarray:
+    """Force-include and duplicate sequences containing kickoff frames (3x).
+
+    kickoff_feat_offset: the index in the feature vector where is_kickoff lives.
+    """
+    X = np.lib.format.open_memmap(x_path, mode="r")
+    extra = []
+    for start in seq_starts:
+        end = start + T
+        if np.any(X[start:end, kickoff_feat_offset] > 0.5):
+            extra.extend([start, start])  # +2 copies (total 3x including original)
+    if extra:
+        print(f"  Kickoff oversampling: +{len(extra):,} duplicate sequences")
+    return np.concatenate([seq_starts, np.array(extra, dtype=np.int64)])
+
+
 # ── LR schedule ───────────────────────────────────────────────────────────────
 
 def cosine_schedule_with_warmup(optimizer: torch.optim.Optimizer,
@@ -683,15 +977,15 @@ def cosine_schedule_with_warmup(optimizer: torch.optim.Optimizer,
 
 def evaluate(loader: DataLoader,
              model: CitrusTransformerBC,
-             pos_weights: torch.Tensor,
+             action_ce_fn: nn.Module,
              stk_weights: torch.Tensor,
              device: torch.device,
              use_amp: bool) -> dict:
     model.eval()
-    bce_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weights.to(device))
     ce_fns = [nn.CrossEntropyLoss(weight=stk_weights[i].to(device)) for i in range(STICK_DIM)]
+    vocab = ACTION_VOCAB.to(device)  # [NUM_ACTIONS, 7]
 
-    total_bce = total_ce = n_batches = 0
+    total_act_ce = total_stk_ce = n_batches = 0
     all_btn_pred, all_btn_true = [], []
     all_stk_pred, all_stk_true = [], []
     all_stk_pred_bins = []
@@ -700,29 +994,31 @@ def evaluate(loader: DataLoader,
         for X_b, y_b in loader:
             X_b = X_b.to(device, non_blocking=True)   # [B, T, F]
             y_b = y_b.to(device, non_blocking=True)   # [B, T, L]
-            X_b[:, :, -PREV_ACTION_DIM:] = 0.0        # zero prev_labels — matches inference
             btn_true = y_b[:, :, :BUTTON_DIM]
             stk_bins = float_to_bin(y_b[:, :, BUTTON_DIM:])
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                btn_logits, stk_logits, _ = model(X_b, btn_true, stk_bins)
+                action_logits, stk_logits, _ = model(X_b, btn_true, stk_bins)
 
             B, T = X_b.shape[:2]
-            bce = bce_fn(btn_logits.float().reshape(B * T, BUTTON_DIM),
-                         btn_true.reshape(B * T, BUTTON_DIM))
-            ce  = sum(
+            action_true = labels_to_action_idx(btn_true)  # [B, T]
+            act_ce = action_ce_fn(action_logits.float().reshape(B * T, NUM_ACTIONS),
+                                  action_true.reshape(B * T))
+            stk_ce = sum(
                 ce_fns[i](stk_logits[i].float().reshape(-1, STICK_BINS),
                            stk_bins[:, :, i].reshape(-1))
                 for i in range(STICK_DIM)
             ) / STICK_DIM
 
-            if not (math.isfinite(bce.item()) and math.isfinite(ce.item())):
+            if not (math.isfinite(act_ce.item()) and math.isfinite(stk_ce.item())):
                 continue
-            total_bce += bce.item()
-            total_ce  += ce.item()
+            total_act_ce += act_ce.item()
+            total_stk_ce += stk_ce.item()
             n_batches += 1
 
-            btn_pred = (torch.sigmoid(btn_logits) > 0.5).reshape(B * T, BUTTON_DIM).cpu().numpy()
+            # Predict buttons: argmax over action logits → lookup vocab for 7 binary flags
+            action_pred_idx = action_logits.argmax(dim=-1)  # [B, T]
+            btn_pred = vocab[action_pred_idx.reshape(-1)].cpu().numpy()  # [B*T, 7]
             all_btn_pred.append(btn_pred)
             all_btn_true.append(btn_true.reshape(B * T, BUTTON_DIM).cpu().numpy())
 
@@ -732,8 +1028,8 @@ def evaluate(loader: DataLoader,
             all_stk_true.append(y_b[:, :, BUTTON_DIM:].reshape(B * T, STICK_DIM).cpu().numpy())
             all_stk_pred_bins.append(stk_pred_bins.reshape(B * T, STICK_DIM).cpu().numpy())
 
-    avg_bce = total_bce / max(n_batches, 1)
-    avg_ce  = total_ce  / max(n_batches, 1)
+    avg_act_ce = total_act_ce / max(n_batches, 1)
+    avg_stk_ce = total_stk_ce / max(n_batches, 1)
 
     btn_pred = np.concatenate(all_btn_pred)
     btn_true = np.concatenate(all_btn_true)
@@ -762,14 +1058,14 @@ def evaluate(loader: DataLoader,
     cstick_err_deg = float(np.degrees(cd.mean()))
 
     idle_mask = np.all(btn_true < 0.5, axis=1)
-    idle_acc  = float(np.all(btn_pred[idle_mask] == 0, axis=1).mean()) if idle_mask.any() else 1.0
+    idle_acc  = float(np.all(btn_pred[idle_mask] < 0.5, axis=1).mean()) if idle_mask.any() else 1.0
 
     neutral_bin = STICK_BINS // 2  # bin 10 for STICK_BINS=21
     stk_pred_bins = np.concatenate(all_stk_pred_bins)  # [N, 4]
     nonneut_pct = [(stk_pred_bins[:, i] != neutral_bin).mean() for i in range(STICK_DIM)]
 
     return {
-        "loss": avg_bce + avg_ce, "bce": avg_bce, "ce": avg_ce,
+        "loss": avg_act_ce + avg_stk_ce, "act_ce": avg_act_ce, "stk_ce": avg_stk_ce,
         "f1": f1, "stick_err_deg": stick_err_deg, "cstick_err_deg": cstick_err_deg,
         "idle_acc": idle_acc, "nonneut_pct": nonneut_pct,
     }
@@ -782,7 +1078,7 @@ def composite_score(m: dict) -> float:
 def print_eval(tag: str, m: dict) -> None:
     f1s = "  ".join(f"{k}={v:.3f}" for k, v in m["f1"].items())
     nn = m.get("nonneut_pct", [0, 0, 0, 0])
-    print(f"  [{tag}] loss={m['loss']:.4f}  bce={m['bce']:.4f}  stk_ce={m['ce']:.4f}")
+    print(f"  [{tag}] loss={m['loss']:.4f}  act_ce={m['act_ce']:.4f}  stk_ce={m['stk_ce']:.4f}")
     print(f"         F1: {f1s}")
     print(f"         stick_err={m['stick_err_deg']:.1f}°  cstick_err={m['cstick_err_deg']:.1f}°  idle_acc={m['idle_acc']:.3f}")
     print(f"         non-neutral: sx={nn[0]:.1%}  sy={nn[1]:.1%}  cx={nn[2]:.1%}  cy={nn[3]:.1%}")
@@ -827,7 +1123,7 @@ def _save_training_plot(history: dict, out_dir: Path) -> None:
         val_losses  = [v for v in history["val_loss"] if v is not None]
         if val_losses:
             ax.plot(val_epochs, val_losses, label="val loss", color="tomato")
-        ax.set_title("Loss (BCE + stk CE)")
+        ax.set_title("Loss (act CE + stk CE)")
         ax.set_xlabel("epoch")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
@@ -846,7 +1142,7 @@ def _save_training_plot(history: dict, out_dir: Path) -> None:
 
         # ── Per-button F1 ──────────────────────────────────────────────────────
         ax = axes[1, 0]
-        colors = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4"]
+        colors = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#42d4f4", "#f032e6"]
         for name, color in zip(BUTTON_NAMES, colors):
             f1_vals   = history["val_f1"][name]
             f1_epochs = [e for e, v in zip(epochs, f1_vals) if v is not None]
@@ -880,13 +1176,81 @@ def _save_training_plot(history: dict, out_dir: Path) -> None:
         print(f"  [plot] warning: could not save training_curves.png — {exc}")
 
 
+# ── Scheduled Sampling ────────────────────────────────────────────────────────
+
+def build_predicted_prev_labels(action_logits: torch.Tensor,
+                                stk_logits: list,
+                                ) -> torch.Tensor:
+    """Convert model outputs into a prev_labels tensor suitable for replacing
+    ground-truth prev_action features in the input.
+
+    action_logits: [B, T, NUM_ACTIONS] — raw categorical logits
+    stk_logits:    list of STICK_DIM tensors, each [B, T, STICK_BINS]
+
+    Returns: [B, T, PREV_ACTION_DIM] where:
+        [:, :, :BUTTON_DIM] = ACTION_VOCAB[sampled_action] (binary 0/1)
+        [:, :, BUTTON_DIM:] = bin_to_float(argmax(stk_logits)) (continuous [-1,1])
+    """
+    # Gumbel-max sample an action index from the categorical
+    gumbel = -torch.log(-torch.log(torch.rand_like(action_logits) + 1e-20) + 1e-20)
+    action_idx = (action_logits + gumbel).argmax(dim=-1)             # [B, T]
+    # Look up 7 binary button flags from the vocabulary
+    vocab = ACTION_VOCAB.to(action_logits.device)                    # [12, 7]
+    btn_binary = vocab[action_idx]                                   # [B, T, 7]
+    stk_vals   = torch.stack(
+        [bin_to_float(logit.argmax(dim=-1)) for logit in stk_logits],
+        dim=-1)                                                      # [B, T, 4]
+    return torch.cat([btn_binary, stk_vals], dim=-1)                 # [B, T, 11]
+
+
+def apply_scheduled_sampling(X_b: torch.Tensor,
+                             pred_prev: torch.Tensor,
+                             ss_prob: float,
+                             norm_mean: torch.Tensor,
+                             norm_std: torch.Tensor,
+                             ) -> torch.Tensor:
+    """Replace ground-truth prev_labels in X_b with model predictions.
+
+    For each frame t > 0 in each sequence, with probability ss_prob, overwrite
+    the prev_action features (X_b[:, t, PREV_ACTION_OFFSET:]) with the model's
+    prediction from frame t-1 (pred_prev[:, t-1, :]).
+
+    pred_prev is in raw space (sigmoid probs / [-1,1] floats).  Since X_b is
+    already normalised by the dataset, we normalise pred_prev the same way
+    before inserting.
+
+    Frame t=0 always keeps ground truth (no t-1 prediction available).
+
+    Returns a new tensor (X_b is not modified in-place).
+    """
+    if ss_prob <= 0.0:
+        return X_b
+    X_mixed = X_b.clone()
+    B, T, _ = X_b.shape
+    # Normalise predicted prev_labels to match the dataset's normalisation
+    pa_mean = norm_mean[PREV_ACTION_OFFSET:PREV_ACTION_OFFSET + PREV_ACTION_DIM].to(X_b.device)
+    pa_std  = norm_std[PREV_ACTION_OFFSET:PREV_ACTION_OFFSET + PREV_ACTION_DIM].to(X_b.device)
+    pred_normed = (pred_prev - pa_mean) / pa_std                     # [B, T, 11]
+    # Bernoulli mask: [B, T-1] — which frames get predicted prev_labels
+    mask = torch.rand(B, T - 1, device=X_b.device) < ss_prob        # [B, T-1]
+    mask = mask.unsqueeze(-1).expand(-1, -1, PREV_ACTION_DIM)       # [B, T-1, 11]
+    # pred_normed[:, :-1, :] = predictions at frames 0..T-2, used as prev_labels for frames 1..T-1
+    X_mixed[:, 1:, PREV_ACTION_OFFSET:PREV_ACTION_OFFSET + PREV_ACTION_DIM] = torch.where(
+        mask,
+        pred_normed[:, :-1, :],
+        X_b[:, 1:, PREV_ACTION_OFFSET:PREV_ACTION_OFFSET + PREV_ACTION_DIM],
+    )
+    return X_mixed
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 
 def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
           epochs: int, batch_size: int, lr: float, weight_decay: float,
           seed: int, neutral_keep: float, warmup_steps: int, eval_every: int,
           num_workers: int, use_amp: bool, grad_accum: int,
-          resume: str | None = None, start_epoch: int = 1) -> None:
+          resume: str | None = None, start_epoch: int = 1,
+          ss_max: float = 0.5, ss_warmup: int = 3) -> None:
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -926,9 +1290,17 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
 
     # ── Oversampling ─────────────────────────────────────────────────────────
     train_seq_s = oversample_seqs(train_seq, action_mask, SEQ_LEN, neutral_keep, seed)
-    action_n    = int((action_mask[train_seq + SEQ_LEN // 2] > 0).sum())
     print(f"\nOversampling (neutral_keep={neutral_keep:.0%}):")
-    print(f"  Training set after oversampling: {len(train_seq_s):,} sequences")
+    print(f"  After neutral undersampling: {len(train_seq_s):,} sequences")
+
+    # Rare-action oversampling (v6): duplicate sequences with X, lob, chip, Y, deke
+    train_seq_s = oversample_rare_actions(train_seq_s, y_path, SEQ_LEN, seed)
+
+    # Kickoff oversampling (v6): force-include sequences overlapping kickoff phase
+    # is_kickoff is at absolute offset 181 in the flat feature vector:
+    # context token starts at 174, is_kickoff is at context[7] (after tactical×5 + possession×2)
+    kickoff_offset = 174 + 5 + 2  # = 181
+    train_seq_s = oversample_kickoff_seqs(train_seq_s, x_path, SEQ_LEN, kickoff_offset)
 
     # ── Normalization stats ───────────────────────────────────────────────────
     norm_path = out / "norm_stats.npz"
@@ -946,9 +1318,10 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
     norm_mean_t = torch.from_numpy(norm_mean)  # keep on CPU; dataset applies per-item
     norm_std_t  = torch.from_numpy(norm_std)
 
-    # ── Positive-class weights and stick bin weights ──────────────────────────
+    # ── Action vocabulary weights and stick bin weights ─────────────────────
     print()
-    pos_weights, _ = compute_pos_weights(y_path, train_end)
+    action_weights = compute_action_weights(y_path, train_end)
+    action_ce_fn = nn.CrossEntropyLoss(weight=action_weights.to(device))
     print()
     stk_weights = compute_stick_bin_weights(y_path, train_end)
 
@@ -971,7 +1344,11 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
 
     if resume:
         print(f"\nResuming from: {resume}  (starting at epoch {start_epoch})")
-        model.load_state_dict(torch.load(resume, map_location=device))
+        ckpt = torch.load(resume, map_location=device)
+        if isinstance(ckpt, dict) and "model" in ckpt:
+            model.load_state_dict(ckpt["model"])
+        else:
+            model.load_state_dict(ckpt)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -985,20 +1362,20 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
     scheduler = cosine_schedule_with_warmup(optimizer, warmup_steps, total_opt_steps,
                                              last_epoch=steps_already_done - 1)
     scaler    = torch.amp.GradScaler("cuda") if use_amp else None
-
-    bce_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weights.to(device))
-    ce_fns = [nn.CrossEntropyLoss(weight=stk_weights[i].to(device)) for i in range(STICK_DIM)]
+    ce_fns    = [nn.CrossEntropyLoss(weight=stk_weights[i].to(device)) for i in range(STICK_DIM)]
 
     print(f"\nTraining: {epochs} epochs × {len(train_loader):,} batches/epoch"
           f"  (batch={batch_size} × T={SEQ_LEN} = {batch_size * SEQ_LEN:,} frames/step)")
+
     print(f"  Optimiser: AdamW  lr={lr}  wd={weight_decay}"
           f"  warmup={warmup_steps} steps  grad_accum={grad_accum}")
     print(f"  AMP: {'enabled (bf16)' if use_amp else 'disabled'}")
+    print(f"  Loss: action CE ({NUM_ACTIONS}-class) + weighted CE sticks")
     print("-" * 70)
 
     # CSV log
     csv_path = out / "training_history.csv"
-    csv_cols  = (["epoch", "train_loss", "train_bce", "val_loss", "val_bce", "gap",
+    csv_cols  = (["epoch", "train_loss", "train_act_ce", "val_loss", "val_act_ce", "gap",
                   "val_composite"]
                  + [f"val_f1_{n}" for n in BUTTON_NAMES]
                  + ["val_stick_err_deg", "val_idle_acc"])
@@ -1050,16 +1427,27 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
-        epoch_bce = epoch_ce = 0.0
+        epoch_act_ce = epoch_stk_ce = 0.0
         n_batches = 0
         t0 = time.time()
+
+        # ── Scheduled sampling probability for this epoch ─────────────────────
+        # Ramps linearly from 0 to ss_max after ss_warmup epochs.
+        # During warmup epochs, ss_prob stays 0 (pure teacher forcing).
+        if ss_max > 0 and epoch > ss_warmup:
+            ss_prob = min(ss_max, ss_max * (epoch - ss_warmup) / max(epochs - ss_warmup, 1))
+        else:
+            ss_prob = 0.0
+        if epoch == start_epoch or ss_prob > 0:
+            print(f"  scheduled_sampling: prob={ss_prob:.3f} (max={ss_max}, warmup={ss_warmup})",
+                  flush=True)
 
         optimizer.zero_grad()
 
         for batch_i, (X_b, y_b) in enumerate(train_loader):
             X_b = X_b.to(device, non_blocking=True)   # [B, T, F]
             y_b = y_b.to(device, non_blocking=True)   # [B, T, L]
-            X_b[:, :, -PREV_ACTION_DIM:] = 0.0        # zero prev_labels — matches inference
+            # v6: prev_labels are re-enabled (no longer zeroed)
 
             # Skip batches with corrupt input data before doing any GPU work
             if not torch.isfinite(X_b).all():
@@ -1069,26 +1457,37 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
 
             btn_true = y_b[:, :, :BUTTON_DIM]
             stk_bins = float_to_bin(y_b[:, :, BUTTON_DIM:])
+            action_true = labels_to_action_idx(btn_true)          # [B, T] int64
+
+            # ── Scheduled sampling: two-pass when active ──────────────────────
+            # Pass 1 (no grad): get model predictions with ground-truth inputs.
+            # Then mix predicted prev_labels into the input for pass 2.
+            if ss_prob > 0:
+                with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+                    action_logits_p1, stk_logits_p1, _ = model(X_b, btn_true, stk_bins)
+                pred_prev = build_predicted_prev_labels(action_logits_p1, stk_logits_p1)
+                X_b = apply_scheduled_sampling(X_b, pred_prev, ss_prob,
+                                               norm_mean_t, norm_std_t)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                btn_logits, stk_logits, _ = model(X_b, btn_true, stk_bins)
+                action_logits, stk_logits, _ = model(X_b, btn_true, stk_bins)
                 B, T = X_b.shape[:2]
                 # Cast logits to fp32 before loss — bf16 logits can overflow in exp()
-                # inside CrossEntropyLoss/BCEWithLogitsLoss, producing NaN.
-                bce = bce_fn(btn_logits.float().reshape(B * T, BUTTON_DIM),
-                             btn_true.reshape(B * T, BUTTON_DIM))
-                ce  = sum(
+                # inside CrossEntropyLoss, producing NaN.
+                act_ce = action_ce_fn(action_logits.float().reshape(B * T, NUM_ACTIONS),
+                                      action_true.reshape(B * T))
+                stk_ce = sum(
                     ce_fns[i](stk_logits[i].float().reshape(-1, STICK_BINS),
                                stk_bins[:, :, i].reshape(-1))
                     for i in range(STICK_DIM)
                 ) / STICK_DIM
-                loss = (bce + ce) / grad_accum
+                loss = (act_ce + stk_ce) / grad_accum
 
             # Check for NaN/Inf BEFORE backward — accumulating NaN gradients
             # poisons model weights even when the optimizer step is skipped.
             if not torch.isfinite(loss * grad_accum):
                 print(f"  WARN: non-finite loss at epoch {epoch} batch {batch_i} "
-                      f"(bce={bce.item():.4f} stk_ce={ce.item():.4f}) — skipping",
+                      f"(act_ce={act_ce.item():.4f} stk_ce={stk_ce.item():.4f}) — skipping",
                       flush=True)
                 optimizer.zero_grad()
                 continue
@@ -1098,9 +1497,9 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
             else:
                 loss.backward()
 
-            epoch_bce += bce.item()
-            epoch_ce  += ce.item()
-            n_batches += 1
+            epoch_act_ce += act_ce.item()
+            epoch_stk_ce += stk_ce.item()
+            n_batches    += 1
 
             # Gradient step every grad_accum batches
             if (batch_i + 1) % grad_accum == 0:
@@ -1120,27 +1519,41 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
                 cur_lr = scheduler.get_last_lr()[0]
                 pct    = (batch_i + 1) / len(train_loader) * 100
                 print(f"  epoch {epoch}  [{pct:5.1f}%]  "
-                      f"bce={epoch_bce / n_batches:.4f}  "
-                      f"stk_ce={epoch_ce / n_batches:.4f}  "
+                      f"act_ce={epoch_act_ce / n_batches:.4f}  "
+                      f"stk_ce={epoch_stk_ce / n_batches:.4f}  "
                       f"lr={cur_lr:.2e}",
                       flush=True)
 
-        train_bce  = epoch_bce / max(n_batches, 1)
-        train_ce   = epoch_ce  / max(n_batches, 1)
-        train_loss = train_bce + train_ce
-        elapsed    = time.time() - t0
+        train_act_ce = epoch_act_ce / max(n_batches, 1)
+        train_stk_ce = epoch_stk_ce / max(n_batches, 1)
+        train_loss   = train_act_ce + train_stk_ce
+        elapsed      = time.time() - t0
         print(f"\nEpoch {epoch:3d}/{epochs}  ({elapsed:.0f}s)")
-        print(f"  [train] loss={train_loss:.4f}  bce={train_bce:.4f}  stk_ce={train_ce:.4f}")
+        print(f"  [train] loss={train_loss:.4f}  act_ce={train_act_ce:.4f}  stk_ce={train_stk_ce:.4f}")
 
         do_eval = (epoch % eval_every == 0) or (epoch == epochs)
         if do_eval:
-            val_m   = evaluate(val_loader, model, pos_weights, stk_weights, device, use_amp)
+            val_m   = evaluate(val_loader, model, action_ce_fn, stk_weights, device, use_amp)
             score   = composite_score(val_m)
             is_best = val_m["loss"] < best_val_loss
             if is_best:
                 best_val_loss = val_m["loss"]
                 best_epoch    = epoch
                 torch.save(model.state_dict(), out / "best_model.pt")
+
+            # Full checkpoint every 5 epochs (v6: includes optimizer + scheduler state)
+            if epoch % 5 == 0 or epoch == epochs:
+                ckpt = {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_val_loss": best_val_loss,
+                    "best_epoch": best_epoch,
+                }
+                ckpt_path = out / f"checkpoint_epoch{epoch}.pt"
+                torch.save(ckpt, ckpt_path)
+                print(f"  Checkpoint saved: {ckpt_path}")
             gap      = val_m["loss"] - train_loss
             gap_flag = "  << overfitting" if gap > 0.05 else ""
             print_eval("val", val_m)
@@ -1149,13 +1562,13 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
                   f"best val_loss={best_val_loss:.4f} (epoch {best_epoch})"
                   + (" <- best" if is_best else ""))
             f1 = val_m["f1"]
-            csv_row = ([epoch, train_loss, train_bce,
-                        val_m["loss"], val_m["bce"], gap, score]
+            csv_row = ([epoch, train_loss, train_act_ce,
+                        val_m["loss"], val_m["act_ce"], gap, score]
                        + [f1.get(n) for n in BUTTON_NAMES]
                        + [val_m["stick_err_deg"], val_m["idle_acc"]])
         else:
             print(f"  [val skipped — eval_every={eval_every}]")
-            csv_row = ([epoch, train_loss, train_bce,
+            csv_row = ([epoch, train_loss, train_act_ce,
                         None, None, None, None]
                        + [None] * len(BUTTON_NAMES) + [None, None])
 
@@ -1194,7 +1607,7 @@ def train(x_path: str, y_path: str, ms_path: str, seg_path: str, out_dir: str,
     print("TEST SET EVALUATION (best model)")
     print("=" * 70)
     model.load_state_dict(torch.load(out / "best_model.pt", map_location=device))
-    test_m = evaluate(test_loader, model, pos_weights, stk_weights, device, use_amp)
+    test_m = evaluate(test_loader, model, action_ce_fn, stk_weights, device, use_amp)
     print_eval("test", test_m)
     print_targets(test_m)
 
@@ -1234,6 +1647,10 @@ if __name__ == "__main__":
                         help="Path to model weights (.pt) to resume from")
     parser.add_argument("--start-epoch",  type=int,   default=1,
                         help="Epoch to start from when resuming (1-based; used to fast-forward LR schedule)")
+    parser.add_argument("--ss-max",       type=float, default=0.5,
+                        help="Scheduled sampling max probability (default 0.5; 0 to disable)")
+    parser.add_argument("--ss-warmup",    type=int,   default=3,
+                        help="Epochs of pure teacher forcing before scheduled sampling ramps up (default 3)")
 
     args = parser.parse_args()
 
@@ -1256,4 +1673,6 @@ if __name__ == "__main__":
         grad_accum   = args.grad_accum,
         resume       = args.resume,
         start_epoch  = args.start_epoch,
+        ss_max       = args.ss_max,
+        ss_warmup    = args.ss_warmup,
     )

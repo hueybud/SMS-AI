@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""export_onnx_transformer.py — Export trained CitrusTransformerBC to stateful ONNX.
+"""export_onnx_transformer.py — Export trained CitrusTransformerBC (v6) to stateful ONNX.
 
 The exported model processes one game frame at a time.  It accepts the KV cache
 (past keys/values for all temporal transformer layers) as an explicit input and
@@ -8,12 +8,13 @@ every OnFrameEnd() call, maintaining temporal context across the match.
 
 ONNX I/O:
     Inputs:
-        features     [1, 442]          — single game frame (raw, unnormalized)
-        kv_cache_in  [3, 2, 1, 63, 512] — past KV state (layers, k/v, batch, seq, dim)
+        features     [1, 194]              — single game frame (raw, unnormalized)
+        kv_cache_in  [3, 2, 1, 127, 512]   — past KV state (layers, k/v, batch, seq, dim)
     Outputs:
-        btn_probs    [1, 6]             — button probabilities (sigmoid, A B X Y L R)
-        stick_vals   [1, 4]             — stick values in [-1,1] (AR bins→float)
-        kv_cache_out [3, 2, 1, 63, 512] — updated KV state (oldest frame evicted)
+        btn_probs    [1, 7]                — button flags (0.0 or 1.0)
+                                             A B X Y lob_pass chip_shot R
+        stick_vals   [1, 4]                — stick values in [-1,1] (Gumbel-max sampled)
+        kv_cache_out [3, 2, 1, 127, 512]   — updated KV state (oldest frame evicted)
 
 Usage:
     python export_onnx_transformer.py best_model.pt best_model.onnx
@@ -24,8 +25,8 @@ Verify with:
     import onnxruntime as ort, numpy as np
     sess = ort.InferenceSession('best_model.onnx')
     feeds = {
-        'features':    np.zeros((1, 442), dtype=np.float32),
-        'kv_cache_in': np.zeros((3, 2, 1, 63, 512), dtype=np.float32),
+        'features':    np.zeros((1, 194), dtype=np.float32),
+        'kv_cache_in': np.zeros((3, 2, 1, 127, 512), dtype=np.float32),
     }
     btn, stk, kv = sess.run(None, feeds)
     print('btn:', btn.shape, 'stk:', stk.shape, 'kv:', kv.shape)
@@ -44,46 +45,81 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ── Constants (must stay in sync with train_transformer.py) ───────────────────
+# ── Constants (must stay in sync with train_transformer.py v6) ───────────────
 
-SEQ_LEN        = 64
-FEATURE_DIM    = 442
-BUTTON_DIM     = 6
+SEQ_LEN        = 128
+FEATURE_DIM    = 194
+BUTTON_DIM     = 7
 STICK_DIM      = 4
 STICK_BINS     = 21
-ENTITY_RAW_DIM = 64
-N_ENTITIES     = 16
-N_ENTITY_TYPES = 9
-ENTITY_DIM     = 256
-ENTITY_LAYERS  = 2
-ENTITY_HEADS   = 4
-TEMPORAL_DIM   = 512
+ENTITY_RAW_DIM = 32
+N_ENTITIES     = 20
+N_ENTITY_TYPES = 11
+
+# Action state embedding dims
+STRIKER_STATE_VOCAB = 30
+GOALIE_STATE_VOCAB  = 27
+STATE_EMBED_DIM     = 8
+FIELD_ITEM_VOCAB    = 10
+ITEM_EMBED_DIM      = 4
+
+NUM_ACTIONS     = 12
+ACTION_VOCAB    = torch.tensor([
+    [0, 0, 0, 0, 0, 0, 0],   #  0: (none)
+    [0, 0, 0, 0, 0, 0, 1],   #  1: R
+    [1, 0, 0, 0, 0, 0, 0],   #  2: A
+    [1, 0, 0, 0, 0, 0, 1],   #  3: A+R
+    [0, 1, 0, 0, 0, 0, 0],   #  4: B
+    [0, 1, 0, 0, 0, 0, 1],   #  5: B+R
+    [0, 0, 0, 1, 0, 0, 0],   #  6: Y
+    [0, 0, 0, 1, 0, 0, 1],   #  7: Y+R
+    [0, 0, 1, 0, 0, 0, 0],   #  8: X
+    [0, 0, 1, 0, 0, 0, 1],   #  9: X+R
+    [1, 0, 0, 0, 1, 0, 0],   # 10: L+A (lob pass)
+    [0, 1, 0, 0, 0, 1, 0],   # 11: L+B (chip shot)
+], dtype=torch.float32)
+
+ENTITY_DIM      = 256
+ENTITY_LAYERS   = 2
+ENTITY_HEADS    = 4
+TEMPORAL_DIM    = 512
 TEMPORAL_LAYERS = 3
 TEMPORAL_HEADS  = 4
-FF_MULT        = 2
+FF_MULT         = 2
 
+# Entity token layout (v6)
 _ENTITY_DEFS: List[Tuple[int, int, int]] = [
-    (  0,  19, 0),
-    ( 19,  67, 1),
-    ( 67, 103, 2),
-    (103, 139, 2),
-    (139, 175, 2),
-    (175, 205, 3),
-    (205, 241, 4),
-    (241, 277, 4),
-    (277, 313, 4),
-    (313, 349, 4),
-    (349, 379, 5),
-    (379, 390, 6),
-    (390, 401, 6),
-    (401, 412, 7),
-    (412, 423, 7),
-    (423, 442, 8),
+    (  0,  22, 0),  # ball: pos×3 vel×3 charge pp b2g×3 + owner_oh×11
+    ( 22,  41, 1),  # self: pos_delta×3 state_idx×1 heading×2 goal×3 effect×5 spd×3 timer carrier
+    ( 41,  48, 2),  # friendly striker 0
+    ( 48,  55, 2),  # friendly striker 1
+    ( 55,  62, 2),  # friendly striker 2
+    ( 62,  66, 3),  # friendly goalie
+    ( 66,  73, 4),  # enemy striker 0
+    ( 73,  80, 4),  # enemy striker 1
+    ( 80,  87, 4),  # enemy striker 2
+    ( 87,  94, 4),  # enemy striker 3
+    ( 94,  98, 5),  # enemy goalie
+    ( 98, 109, 6),  # own inventory 0
+    (109, 120, 6),  # own inventory 1
+    (120, 131, 7),  # enemy inventory 0
+    (131, 142, 7),  # enemy inventory 1
+    (142, 150, 8),  # field item 0
+    (150, 158, 8),  # field item 1
+    (158, 166, 8),  # field item 2
+    (166, 174, 8),  # field item 3
+    (174, 194, 9),  # context: tactical×5 possession×2 phase×2 prev_action×11
 ]
 _ENTITY_TYPE_IDS = [t for _, _, t in _ENTITY_DEFS]
 
+# Offsets within entity tokens where the integer index lives
+_SELF_STATE_IDX_OFFSET    = 3
+_STRIKER_STATE_IDX_OFFSET = 3
+_GOALIE_STATE_IDX_OFFSET  = 3
+_ITEM_TYPE_IDX_OFFSET     = 0
 
-# ── Architecture (replicated from train_transformer.py) ───────────────────────
+
+# ── Architecture (replicated from train_transformer.py v6) ──────────────────
 
 class _FFN(nn.Module):
     def __init__(self, dim: int):
@@ -104,7 +140,10 @@ class EntityTransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a, _ = self.attn(x, x, x)
+        orig_dtype = x.dtype
+        x32 = x.float()
+        a, _ = self.attn(x32, x32, x32)
+        a = a.to(orig_dtype)
         x = self.norm1(x + a)
         x = self.norm2(x + self.ffn(x))
         return x
@@ -113,7 +152,12 @@ class EntityTransformerLayer(nn.Module):
 class EntityEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        self.proj       = nn.Linear(ENTITY_RAW_DIM, ENTITY_DIM)
+        self.striker_state_embed = nn.Embedding(STRIKER_STATE_VOCAB, STATE_EMBED_DIM)
+        self.goalie_state_embed  = nn.Embedding(GOALIE_STATE_VOCAB,  STATE_EMBED_DIM)
+        self.item_type_embed     = nn.Embedding(FIELD_ITEM_VOCAB,    ITEM_EMBED_DIM)
+
+        self._effective_max = ENTITY_RAW_DIM + STATE_EMBED_DIM
+        self.proj       = nn.Linear(self._effective_max, ENTITY_DIM)
         self.type_embed = nn.Embedding(N_ENTITY_TYPES, ENTITY_DIM)
         self.layers     = nn.ModuleList([
             EntityTransformerLayer(ENTITY_DIM, ENTITY_HEADS)
@@ -123,7 +167,39 @@ class EntityEncoder(nn.Module):
         type_ids = torch.tensor(_ENTITY_TYPE_IDS, dtype=torch.long)
         self.register_buffer("type_ids", type_ids)
 
+    def _embed_state(self, token: torch.Tensor, idx_offset: int,
+                     embed: nn.Embedding) -> torch.Tensor:
+        idx = token[:, idx_offset].long().clamp(0, embed.num_embeddings - 1)
+        emb = embed(idx)
+        before = token[:, :idx_offset]
+        after  = token[:, idx_offset + 1:]
+        return torch.cat([before, emb, after], dim=-1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, _ = x.shape
+        processed = []
+        for i, (s, e, etype) in enumerate(_ENTITY_DEFS):
+            token = x[:, i, :e - s]
+
+            if etype == 1:
+                token = self._embed_state(token, _SELF_STATE_IDX_OFFSET,
+                                           self.striker_state_embed)
+            elif etype == 2 or etype == 4:
+                token = self._embed_state(token, _STRIKER_STATE_IDX_OFFSET,
+                                           self.striker_state_embed)
+            elif etype == 3 or etype == 5:
+                token = self._embed_state(token, _GOALIE_STATE_IDX_OFFSET,
+                                           self.goalie_state_embed)
+            elif etype == 8:
+                token = self._embed_state(token, _ITEM_TYPE_IDX_OFFSET,
+                                           self.item_type_embed)
+
+            if token.shape[1] < self._effective_max:
+                pad = token.new_zeros(B, self._effective_max - token.shape[1])
+                token = torch.cat([token, pad], dim=1)
+            processed.append(token)
+
+        x = torch.stack(processed, dim=1)
         x = self.proj(x) + self.type_embed(self.type_ids)
         for layer in self.layers:
             x = layer(x)
@@ -154,10 +230,11 @@ class TemporalLayer(nn.Module):
         return x.transpose(1, 2).contiguous().view(B, S, self.dim)
 
     def forward_causal(self, x):
-        q = self._split_heads(self.q_proj(x))
-        k = self._split_heads(self.k_proj(x))
-        v = self._split_heads(self.v_proj(x))
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        orig_dtype = x.dtype
+        q = self._split_heads(self.q_proj(x)).float()
+        k = self._split_heads(self.k_proj(x)).float()
+        v = self._split_heads(self.v_proj(x)).float()
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True).to(orig_dtype)
         out = self._merge_heads(out)
         out = self.out_proj(out)
         x = self.norm1(x + out)
@@ -203,19 +280,39 @@ class CausalTemporalTransformer(nn.Module):
         return x.squeeze(1), torch.stack(new_kv, dim=0)
 
 
-class IndependentControllerHead(nn.Module):
+class ConditionalControllerHead(nn.Module):
     def __init__(self, input_dim: int, stick_bins: int = STICK_BINS):
         super().__init__()
         self.stick_bins = stick_bins
-        self.btn_head   = nn.Linear(input_dim, BUTTON_DIM)
-        self.stk_heads  = nn.ModuleList([nn.Linear(input_dim, stick_bins) for _ in range(STICK_DIM)])
+        self.action_head = nn.Linear(input_dim, NUM_ACTIONS)
+        stk_input_dim    = input_dim + NUM_ACTIONS
+        self.stk_heads   = nn.ModuleList([nn.Linear(stk_input_dim, stick_bins)
+                                           for _ in range(STICK_DIM)])
 
-    def forward_infer(self, policy_t):
-        btn_probs = torch.sigmoid(self.btn_head(policy_t))  # [B, BUTTON_DIM]
-        stk_bins  = torch.stack(
-            [self.stk_heads[i](policy_t).argmax(dim=-1) for i in range(STICK_DIM)],
-            dim=-1)  # [B, STICK_DIM]
-        return btn_probs, stk_bins
+    def forward_infer(self, policy_t: torch.Tensor):
+        action_logits = self.action_head(policy_t)        # [B, NUM_ACTIONS]
+        action_probs  = torch.softmax(action_logits, dim=-1)
+
+        # Gumbel-max to sample action index (ONNX-compatible)
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(action_logits) + 1e-20) + 1e-20)
+        action_idx   = (action_logits + gumbel_noise).argmax(dim=-1)  # [B]
+        vocab        = ACTION_VOCAB.to(action_logits.device)
+        btn_flags    = vocab[action_idx]                   # [B, 7] — 0/1 floats
+
+        # Condition sticks on action softmax (differentiable; matches training)
+        stk_input = torch.cat([policy_t, action_probs], dim=-1)
+        stick_vals = torch.stack([
+            self._gumbel_sample(self.stk_heads[i](stk_input))
+            for i in range(STICK_DIM)
+        ], dim=-1)  # [B, 4] continuous values in [-1, 1]
+        return btn_flags, stick_vals
+
+    @staticmethod
+    def _gumbel_sample(logits: torch.Tensor) -> torch.Tensor:
+        """Sample a bin index via Gumbel-max and convert to [-1, 1] float."""
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
+        bin_idx = (logits + gumbel_noise).argmax(dim=-1)          # [B]
+        return bin_idx.float() / (STICK_BINS - 1) * 2.0 - 1.0    # [B] in [-1, 1]
 
 
 class CitrusTransformerBC(nn.Module):
@@ -223,14 +320,14 @@ class CitrusTransformerBC(nn.Module):
         super().__init__()
         self.entity_encoder = EntityEncoder()
         self.temporal       = CausalTemporalTransformer()
-        self.ctrl_head      = IndependentControllerHead(TEMPORAL_DIM)
+        self.ctrl_head      = ConditionalControllerHead(TEMPORAL_DIM)
         self.value_head     = nn.Linear(TEMPORAL_DIM, 1)
 
     def forward_infer(self, entities, kv_cache):
-        frame_emb           = self.entity_encoder(entities)
-        out, kv_cache_out   = self.temporal.forward_cached(frame_emb, kv_cache)
-        btn_probs, stk_bins = self.ctrl_head.forward_infer(out)
-        return btn_probs, stk_bins, kv_cache_out
+        frame_emb             = self.entity_encoder(entities)
+        out, kv_cache_out     = self.temporal.forward_cached(frame_emb, kv_cache)
+        btn_probs, stick_vals = self.ctrl_head.forward_infer(out)
+        return btn_probs, stick_vals, kv_cache_out
 
 
 # ── ONNX-friendly flat→entities ───────────────────────────────────────────────
@@ -256,8 +353,8 @@ def _flat_to_entities_onnx(x: torch.Tensor) -> torch.Tensor:
 class _TransformerSingleFrameWrapper(nn.Module):
     """Wraps CitrusTransformerBC for single-frame stateful ONNX export.
 
-    Takes flat features [1, FEATURE_DIM] and kv_cache [3, 2, 1, 63, 512].
-    Internally runs flat_to_entities → entity_encoder → temporal (cached) → AR head.
+    Takes flat features [1, FEATURE_DIM] and kv_cache [3, 2, 1, 127, 512].
+    Internally runs flat_to_entities → entity_encoder → temporal (cached) → ctrl head.
     Normalization stats are baked in as constants if provided.
     """
 
@@ -279,7 +376,7 @@ class _TransformerSingleFrameWrapper(nn.Module):
         kv_cache_in: [TEMPORAL_LAYERS, 2, 1, SEQ_LEN-1, TEMPORAL_DIM]
 
         Returns:
-            btn_probs    [1, BUTTON_DIM]                          — sigmoid probabilities
+            btn_probs    [1, BUTTON_DIM]                          — 0/1 button flags
             stick_vals   [1, STICK_DIM]                           — values in [-1, 1]
             kv_cache_out [TEMPORAL_LAYERS, 2, 1, SEQ_LEN-1, TEMPORAL_DIM]
         """
@@ -287,10 +384,7 @@ class _TransformerSingleFrameWrapper(nn.Module):
             features = (features - self.norm_mean) / self.norm_std
 
         entities = _flat_to_entities_onnx(features)   # [1, N_ENTITIES, ENTITY_RAW_DIM]
-        btn_probs, stk_bins, kv_cache_out = self.model.forward_infer(entities, kv_cache_in)
-
-        # Convert discrete bin indices → continuous float in [-1, 1]
-        stick_vals = stk_bins.float() / (STICK_BINS - 1) * 2.0 - 1.0  # [1, STICK_DIM]
+        btn_probs, stick_vals, kv_cache_out = self.model.forward_infer(entities, kv_cache_in)
 
         return btn_probs, stick_vals, kv_cache_out
 
@@ -302,6 +396,10 @@ def export(weights_path: str, output_path: str, norm_stats_path: str = None) -> 
 
     model = CitrusTransformerBC().to(device)
     state = torch.load(weights_path, map_location=device)
+    # Support both raw state_dict (best_model.pt) and full checkpoint dicts
+    if isinstance(state, dict) and "model" in state:
+        print(f"Loading from full checkpoint (epoch {state.get('epoch', '?')})")
+        state = state["model"]
     model.load_state_dict(state)
     model.eval()
     print(f"Loaded weights from {weights_path}")
@@ -309,7 +407,6 @@ def export(weights_path: str, output_path: str, norm_stats_path: str = None) -> 
     norm_mean = norm_std = None
     if norm_stats_path:
         stats = np.load(norm_stats_path)
-        # norm_stats were computed on float32 X; load as float32
         norm_mean = torch.from_numpy(stats["mean"].astype("float32"))
         norm_std  = torch.from_numpy(stats["std"].astype("float32"))
         print(f"Loaded norm stats from {norm_stats_path} — baking into ONNX graph")
@@ -370,8 +467,7 @@ def export(weights_path: str, output_path: str, norm_stats_path: str = None) -> 
         btn_out, stk_out, kv_out = sess.run(None, feeds)
         print("onnxruntime validation OK:")
         print(f"  btn_probs    {btn_out.shape}  range=[{btn_out.min():.4f}, {btn_out.max():.4f}]")
-        print(f"  stick_vals   {stk_out.shape}  range=[{stk_out.min():.4f}, {stk_out.max():.4f}]"
-              f"  ({STICK_BINS} bins)")
+        print(f"  stick_vals   {stk_out.shape}  range=[{stk_out.min():.4f}, {stk_out.max():.4f}]")
         print(f"  kv_cache_out {kv_out.shape}")
 
         # Stateful check: cache changes after feeding non-zero input
@@ -391,7 +487,7 @@ def export(weights_path: str, output_path: str, norm_stats_path: str = None) -> 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Export CitrusTransformerBC to stateful ONNX")
+        description="Export CitrusTransformerBC (v6) to stateful ONNX")
     parser.add_argument("weights",      help="Path to best_model.pt (PyTorch state dict)")
     parser.add_argument("output",       help="Output path for .onnx file")
     parser.add_argument("--norm-stats", default=None, metavar="NPZ",

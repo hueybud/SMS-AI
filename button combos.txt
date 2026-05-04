@@ -1,0 +1,68 @@
+Loading /home/ubuntu/SMS AI/scripts/transformer_v2_y.npy ...
+  Shape: (173934421, 11)  dtype: float32
+  Total frames: 173,934,421
+Counting combos ...
+
+======================================================================
+Unique button combos: 49
+======================================================================
+
+Rank         Count        %   Cumul%  Combo
+----------------------------------------------------------------------
+   1    77,286,963   44.43%   44.43%  [np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  R
+   2    66,458,961   38.21%   82.64%  [np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  (none)
+   3     7,063,607    4.06%   86.70%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  B
+   4     5,943,005    3.42%   90.12%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  A+R
+   5     5,431,644    3.12%   93.24%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  A
+   6     5,151,268    2.96%   96.21%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  B+R
+   7     2,767,329    1.59%   97.80%  [np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  Y+R
+   8       985,641    0.57%   98.36%  [np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  X+R
+   9       570,344    0.33%   98.69%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  A+B+R
+  10       518,580    0.30%   98.99%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0)]  A+lob_pass
+  11       363,714    0.21%   99.20%  [np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  X
+  12       263,689    0.15%   99.35%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0)]  B+chip_shot
+  13       249,551    0.14%   99.49%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  A+B
+  14       242,416    0.14%   99.63%  [np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  Y
+  15       234,901    0.14%   99.77%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  A+Y+R
+  16       109,144    0.06%   99.83%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1)]  A+lob_pass+R
+  17       105,519    0.06%   99.89%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1)]  B+chip_shot+R
+  18        54,440    0.03%   99.92%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  A+B+Y+R
+  19        41,546    0.02%   99.95%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0)]  A+B+lob_pass+chip_shot
+  20        38,107    0.02%   99.97%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  A+Y
+  21        13,088    0.01%   99.98%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  B+Y
+  22        13,059    0.01%   99.98%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  A+B+Y
+  23        11,056    0.01%   99.99%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  A+X+R
+  24         6,108    0.00%   99.99%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1)]  A+B+lob_pass+chip_shot+R
+  25         2,922    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  A+X
+  26         2,284    0.00%  100.00%  [np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  X+Y+R
+  27         2,105    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  B+Y+R
+  28         1,566    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  B+X
+  29           768    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  A+X+Y+R
+  30           257    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  A+X+Y
+  31           170    0.00%  100.00%  [np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  X+Y
+  32           162    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0)]  A+Y+lob_pass
+  33            97    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(0)]  A+X+lob_pass
+  34            95    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1)]  A+Y+lob_pass+R
+  35            69    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1)]  A+X+lob_pass+R
+  36            52    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0)]  B+Y+chip_shot
+  37            49    0.00%  100.00%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(1)]  A+B+Y+lob_pass+chip_shot+R
+  38            47    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1), np.uint8(0)]  B+X+chip_shot
+  39            37    0.00%  100.00%  [np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(0)]  A+B+X
+  40            23    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0), np.uint8(1)]  B+X+R
+  41             9    0.00%  100.00%  [np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0)]  A+B+Y+lob_pass+chip_shot
+  42             7    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1)]  A+X+Y+lob_pass+R
+  43             6    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  B+X+Y
+  44             6    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1)]  B+Y+chip_shot+R
+  45             4    0.00%  100.00%  [np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0)]  A+X+Y+lob_pass
+  46             2    0.00%  100.00%  [np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  A+B+X+Y+R
+  47             2    0.00%  100.00%  [np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(0)]  A+B+X+lob_pass+chip_shot
+  48             1    0.00%  100.00%  [np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(0)]  A+B+X+Y
+  49             1    0.00%  100.00%  [np.uint8(0), np.uint8(1), np.uint8(1), np.uint8(1), np.uint8(0), np.uint8(0), np.uint8(1)]  B+X+Y+R
+
+======================================================================
+Frequency cutoffs:
+  >=  0.01% of frames:  20 combos, covering 99.97% of data
+  >=  0.05% of frames:  17 combos, covering 99.89% of data
+  >=  0.10% of frames:  15 combos, covering 99.77% of data
+  >=  0.50% of frames:   8 combos, covering 98.36% of data
+  >=  1.00% of frames:   7 combos, covering 97.80% of data
