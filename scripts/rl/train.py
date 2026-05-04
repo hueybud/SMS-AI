@@ -151,6 +151,12 @@ def main() -> int:
     p.add_argument("--num-epochs", type=int, default=2)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
+    p.add_argument("--replay-mode", choices=("parallel", "loop"),
+                   default="parallel",
+                   help="PPO replay path: 'parallel' batches the whole "
+                        "rollout through one SDPA per layer (default, "
+                        "slippi-ai-style); 'loop' is the original 240-frame "
+                        "Python loop kept for fallback / debugging")
     args = p.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -180,7 +186,9 @@ def main() -> int:
         kl_teacher_weight=args.kl_teacher,
         learning_rate=args.lr,
         num_epochs=args.num_epochs,
+        replay_mode=args.replay_mode,
     )
+    print(f"[train] replay_mode={args.replay_mode}")
     learner = PPOLearner(
         policy=policy,
         teacher=teacher,

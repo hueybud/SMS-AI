@@ -258,6 +258,32 @@ class TemporalLayer(nn.Module):
         v_full = self._merge_heads(v_all)
         return x, k_full[:, 1:, :], v_full[:, 1:, :]
 
+    def forward_with_initial_kv(self, x, k_cache, v_cache):
+        # Parallel forward over a contiguous segment with a prepended KV
+        # cache.  Output for query t is mathematically identical to running
+        # forward_cached() frame-by-frame: query t attends to the sliding
+        # window [t, S_cache + t] of K_full = concat(k_cache, K_new), which
+        # is exactly the 128-token cache that forward_cached would have at
+        # frame t.
+        S = k_cache.size(1)
+        T = x.size(1)
+        q = self._split_heads(self.q_proj(x))
+        k_new = self._split_heads(self.k_proj(x))
+        v_new = self._split_heads(self.v_proj(x))
+        k_all = torch.cat([self._split_heads(k_cache), k_new], dim=2)
+        v_all = torch.cat([self._split_heads(v_cache), v_new], dim=2)
+        device = x.device
+        key_idx = torch.arange(S + T, device=device)
+        query_idx = torch.arange(T, device=device)
+        attn_mask = (key_idx.unsqueeze(0) >= query_idx.unsqueeze(1)) & \
+                    (key_idx.unsqueeze(0) <= S + query_idx.unsqueeze(1))
+        out = F.scaled_dot_product_attention(q, k_all, v_all, attn_mask=attn_mask)
+        out = self._merge_heads(out)
+        out = self.out_proj(out)
+        x = self.norm1(x + out)
+        x = self.norm2(x + self.ffn(x))
+        return x
+
 
 class CausalTemporalTransformer(nn.Module):
     def __init__(self):
@@ -278,6 +304,17 @@ class CausalTemporalTransformer(nn.Module):
             x, k_new, v_new = layer.forward_cached(x, kv_cache[i, 0], kv_cache[i, 1])
             new_kv.append(torch.stack([k_new, v_new], dim=0))
         return x.squeeze(1), torch.stack(new_kv, dim=0)
+
+    def forward_with_initial_kv(self, emb, initial_kv):
+        # emb: [1, T, D] segment of frame embeddings.
+        # initial_kv: [L, 2, 1, S-1, D] KV state preceding the segment.
+        # Returns: [1, T, D] policy outputs, equivalent to T sequential
+        # forward_cached calls starting from initial_kv (no new cache
+        # returned — replay doesn't carry context across rollouts).
+        x = emb
+        for i, layer in enumerate(self.layers):
+            x = layer.forward_with_initial_kv(x, initial_kv[i, 0], initial_kv[i, 1])
+        return x
 
 
 class ConditionalControllerHead(nn.Module):

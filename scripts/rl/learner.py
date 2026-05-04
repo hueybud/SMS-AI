@@ -86,6 +86,13 @@ class PPOConfig:
     num_epochs: int = 2            # PPO multi-epoch reuse of one rollout
     advantage_normalize: bool = True
 
+    # ── Replay mode ──
+    # "parallel" runs one SDPA call per layer over the whole rollout
+    # (matches slippi-ai's batched-forward design); "loop" is the
+    # original sequential cached path, kept for fallback / debugging.
+    # Equivalence verified by validate_replay_equiv.py to ~3e-6 max diff.
+    replay_mode: str = "parallel"
+
 
 class PPOLearner:
     """Owns the policy + teacher + optimizer; ``update(traj)`` runs PPO.
@@ -268,6 +275,182 @@ class PPOLearner:
         )
 
     # ----------------------------------------------------------------
+    # Parallel replay (one SDPA call per layer over the whole rollout)
+    # ----------------------------------------------------------------
+    def _compute_prev_labels_seq(self, traj: Trajectory) -> np.ndarray:
+        """Vectorize the per-frame prev_labels evolution that ``_replay``
+        does inside its Python loop.
+
+        prev_labels at frame ``t``:
+            - if ``is_resetting[t]``: zeros
+            - elif ``t == 0``: ``traj.initial_prev_labels``
+            - else: ``[btn_flags[t-1], stick_vals[t-1]]``
+        """
+        T = traj.length
+        D = traj.initial_prev_labels.shape[0]
+        prev = np.zeros((T, D), dtype=np.float32)
+        if T > 0:
+            prev[0] = traj.initial_prev_labels
+            if T > 1:
+                prev[1:, :BUTTON_DIM] = traj.btn_flags[:-1]
+                prev[1:, BUTTON_DIM:BUTTON_DIM + STICK_DIM] = traj.stick_vals[:-1]
+        # Reset rows take precedence — overwrite with zeros.
+        for t in range(T):
+            if traj.is_resetting[t]:
+                prev[t] = 0.0
+        return prev
+
+    @staticmethod
+    def _segment_boundaries(traj: Trajectory) -> List[tuple]:
+        """Return ``[(start, end, use_initial_kv), ...]`` covering ``[0, T)``.
+
+        Segments split at every ``is_resetting[t]`` event for ``t > 0`` (a
+        reset zeros the cache before frame ``t``'s forward).  Segment 0
+        uses ``traj.initial_kv`` unless ``is_resetting[0]`` is set, in which
+        case it (and every later segment) starts from a zero cache.
+        """
+        T = traj.length
+        if T == 0:
+            return []
+        starts = [0]
+        for t in range(1, T):
+            if traj.is_resetting[t]:
+                starts.append(t)
+        ends = starts[1:] + [T]
+        first_use_initial = not bool(traj.is_resetting[0])
+        return [
+            (s, e, (i == 0 and first_use_initial))
+            for i, (s, e) in enumerate(zip(starts, ends))
+        ]
+
+    def _forward_segment(
+        self,
+        model: CitrusTransformerBC,
+        entities_seg: torch.Tensor,           # [Tseg, N_E, ERD]
+        initial_kv_seg: torch.Tensor,         # [L, 2, 1, S-1, D]
+    ):
+        """Run one segment through ``model`` in parallel: encode all
+        ``Tseg`` frames at once, single SDPA per layer, then heads applied
+        across the segment.
+
+        Returns ``(action_log_probs [Tseg, NUM_ACTIONS],
+        stick_log_probs List[STICK_DIM] of [Tseg, STICK_BINS],
+        value [Tseg])``.  Value is computed from ``policy_t.detach()`` to
+        keep value-loss gradients off the shared encoder (same trick as
+        the loop path).
+        """
+        frame_emb = model.entity_encoder(entities_seg)              # [Tseg, D]
+        emb = frame_emb.unsqueeze(0)                                # [1, Tseg, D]
+        policy_seq = model.temporal.forward_with_initial_kv(emb, initial_kv_seg)
+        policy_flat = policy_seq.squeeze(0)                         # [Tseg, D]
+
+        action_logits = model.ctrl_head.action_head(policy_flat)    # [Tseg, NUM_ACTIONS]
+        action_log_probs = F.log_softmax(action_logits, dim=-1)
+        action_probs = action_log_probs.exp()
+
+        stk_input = torch.cat([policy_flat, action_probs], dim=-1)  # [Tseg, D + NUM_ACTIONS]
+        stick_log_probs: List[torch.Tensor] = []
+        for i in range(STICK_DIM):
+            stk_logits = model.ctrl_head.stk_heads[i](stk_input)    # [Tseg, STICK_BINS]
+            stick_log_probs.append(F.log_softmax(stk_logits, dim=-1))
+
+        value = model.value_head(policy_flat.detach()).squeeze(-1)  # [Tseg]
+        return action_log_probs, stick_log_probs, value
+
+    def _replay_parallel(self, traj: Trajectory):
+        """Parallel sibling of ``_replay``.  Same return contract::
+
+            (new_log_probs [T], new_values [T], entropies [T], teacher_kls [T])
+
+        Runs the policy + teacher in segment-batched parallel forwards
+        instead of a 240-frame Python loop.  Numerical equivalence with
+        ``_replay`` is verified by ``validate_replay_equiv.py``.
+
+        On A6000: ~50–150 ms per rollout (vs ~30 s in the loop path).
+        On CPU: ~1–3 s (vs ~30 s).
+        """
+        T = traj.length
+        device = self.device
+
+        if traj.initial_kv is None or traj.initial_prev_labels is None:
+            raise RuntimeError(
+                "trajectory missing initial_kv / initial_prev_labels — "
+                "the trainer must snapshot agent state before each rollout"
+            )
+
+        # ── Build the [T, FEATURE_DIM] input tensor for the whole rollout
+        prev_labels_all = self._compute_prev_labels_seq(traj)           # [T, PD]
+        cores = np.stack(
+            [traj.states[t].core_features for t in range(T)], axis=0
+        )                                                                # [T, 183]
+        feat_full = np.concatenate([cores, prev_labels_all], axis=1)    # [T, 194]
+        feat_t = torch.from_numpy(feat_full).to(device)
+        feat_t = (feat_t - self.norm_mean) / self.norm_std              # broadcast [1, FD]
+
+        # Encode entities for the whole rollout in one call.  We then
+        # slice per segment for the temporal forward.
+        entities_all = _flat_to_entities_onnx(feat_t)                   # [T, N_E, ERD]
+
+        initial_kv_t = torch.from_numpy(traj.initial_kv).to(device).contiguous()
+        zero_kv = torch.zeros_like(initial_kv_t)
+        segments = self._segment_boundaries(traj)
+
+        p_action_lps: List[torch.Tensor] = []
+        p_stick_lps: List[List[torch.Tensor]] = [[] for _ in range(STICK_DIM)]
+        p_values: List[torch.Tensor] = []
+
+        t_action_lps: List[torch.Tensor] = []
+        t_stick_lps: List[List[torch.Tensor]] = [[] for _ in range(STICK_DIM)]
+
+        for (s, e, use_initial) in segments:
+            ent_seg = entities_all[s:e]
+            ikv = initial_kv_t if use_initial else zero_kv
+
+            p_alp, p_slps, p_v = self._forward_segment(self.policy, ent_seg, ikv)
+            p_action_lps.append(p_alp)
+            for i in range(STICK_DIM):
+                p_stick_lps[i].append(p_slps[i])
+            p_values.append(p_v)
+
+            with torch.no_grad():
+                t_alp, t_slps, _ = self._forward_segment(self.teacher, ent_seg, ikv)
+                t_action_lps.append(t_alp)
+                for i in range(STICK_DIM):
+                    t_stick_lps[i].append(t_slps[i])
+
+        p_a_lp = torch.cat(p_action_lps, dim=0)                          # [T, NUM_ACTIONS]
+        p_s_lps = [torch.cat(comp, dim=0) for comp in p_stick_lps]       # each [T, STICK_BINS]
+        new_values = torch.cat(p_values, dim=0)                          # [T]
+        t_a_lp = torch.cat(t_action_lps, dim=0)
+        t_s_lps = [torch.cat(comp, dim=0) for comp in t_stick_lps]
+
+        # ── Gather log probs at sampled (action_idx, stick_bin_idx)
+        action_idx_t = torch.from_numpy(traj.action_idx).to(device).long()       # [T]
+        stick_bin_idx_t = torch.from_numpy(traj.stick_bin_idx).to(device).long() # [T, 4]
+
+        new_log_probs = p_a_lp.gather(1, action_idx_t.unsqueeze(1)).squeeze(1)   # [T]
+        for i in range(STICK_DIM):
+            new_log_probs = new_log_probs + p_s_lps[i].gather(
+                1, stick_bin_idx_t[:, i:i + 1]
+            ).squeeze(1)
+
+        # Entropy: sum across the 5 categorical components (action + 4 sticks).
+        def _ent_seq(lp: torch.Tensor) -> torch.Tensor:
+            return -(lp.exp() * lp).sum(dim=-1)
+        entropies = _ent_seq(p_a_lp)
+        for i in range(STICK_DIM):
+            entropies = entropies + _ent_seq(p_s_lps[i])
+
+        # KL(policy ‖ teacher), summed across components.
+        def _kl_seq(p_lp: torch.Tensor, q_lp: torch.Tensor) -> torch.Tensor:
+            return (p_lp.exp() * (p_lp - q_lp)).sum(dim=-1)
+        teacher_kls = _kl_seq(p_a_lp, t_a_lp)
+        for i in range(STICK_DIM):
+            teacher_kls = teacher_kls + _kl_seq(p_s_lps[i], t_s_lps[i])
+
+        return new_log_probs, new_values, entropies, teacher_kls
+
+    # ----------------------------------------------------------------
     # PPO update over a BATCH of trajectories
     # ----------------------------------------------------------------
     def update(self, trajs: List[Trajectory]) -> Dict[str, float]:
@@ -308,11 +491,21 @@ class PPOLearner:
                 advantages.std() + 1e-8
             )
 
+        if self.config.replay_mode == "parallel":
+            replay_fn = self._replay_parallel
+        elif self.config.replay_mode == "loop":
+            replay_fn = self._replay
+        else:
+            raise ValueError(
+                f"unknown replay_mode {self.config.replay_mode!r} "
+                "(must be 'parallel' or 'loop')"
+            )
+
         last_metrics: Dict[str, float] = {}
         for epoch in range(self.config.num_epochs):
             # Replay each trajectory through the (current) policy + teacher
             # and concatenate per-frame outputs.
-            per_traj_outs = [self._replay(t) for t in trajs]
+            per_traj_outs = [replay_fn(t) for t in trajs]
             new_log_probs = torch.cat([o[0] for o in per_traj_outs])
             new_values    = torch.cat([o[1] for o in per_traj_outs])
             entropies     = torch.cat([o[2] for o in per_traj_outs])
