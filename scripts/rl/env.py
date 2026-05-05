@@ -18,6 +18,7 @@ state's frame_id in its action so the C++ side can drop stale actions
 
 from __future__ import annotations
 
+import select
 import socket
 from typing import Optional
 
@@ -33,6 +34,10 @@ class Env:
     def __init__(self, sock: socket.socket):
         self._sock = sock
         self._closed = False
+        # Running total of STATE packets drained as stale.  train.py reads
+        # this between rollouts to log per-rollout drain counts (= number
+        # of game frames not represented in the trajectory).
+        self.drained_states: int = 0
 
     # ------------------------------------------------------------------
     # Core operations
@@ -63,10 +68,65 @@ class Env:
         frame_id: int,
         btn_probs: np.ndarray,
         stick_vals: np.ndarray,
+        drain: bool = True,
     ) -> StateFrame:
-        """Send action + block for next state. Convenience for synchronous play."""
+        """Send action + block for next state. Convenience for synchronous play.
+
+        With ``drain=True`` (default), after reading the next STATE we
+        peek the socket and consume any additional STATE packets that
+        piled up while we were thinking, keeping only the freshest.
+
+        Why drain: the C++ side produces STATE packets at 60 fps
+        regardless of Python's read rate.  RL inference is ~17ms vs
+        16.7ms/frame budget — Python loses ~3% per frame, the OS recv
+        buffer accumulates stale packets monotonically across batches
+        (pause/resume freezes both sides but does NOT drain the
+        backlog), and once the backlog crosses the ~60-frame staleness
+        filter window in HandleAction every action gets rejected.
+        Confirmed in 2026-05-04 run: accepted plateaued, dropped
+        climbed through 1680+ with gap growing 116 → 129.
+
+        Trade-off: occasional act_max spikes (32ms) cause the game to
+        produce ~2 STATEs during one inference; drain discards the
+        intermediate frame so the trajectory has occasional 1-frame
+        skips.  Slop is bounded; slippi-ai's gym makes the same
+        compromise.  The strict fix is synchronous pacing on the C++
+        side (game waits for ACTION before advancing).
+        """
+        if self._closed:
+            raise RuntimeError("Env is closed")
         self.send_action(frame_id, btn_probs, stick_vals)
-        return self.recv_state()
+        state = self.recv_state()
+        if drain:
+            while True:
+                ready, _, _ = select.select([self._sock], [], [], 0)
+                if not ready:
+                    break
+                tag, body = protocol.recv_packet(self._sock)
+                if tag != protocol.TAG_STATE:
+                    raise RuntimeError(
+                        f"unexpected tag during drain: 0x{tag:02x}"
+                    )
+                state = protocol.unpack_state(body)
+                self.drained_states += 1
+        return state
+
+    def pause(self) -> None:
+        """Ask Dolphin to pause the live emulator until ``resume()``.
+
+        Used to freeze gameplay across a slow PPO update so opponents
+        can't score against a held-action AI during the gap.  See
+        AIController.cpp::ReceiverLoop for the C++ side.
+        """
+        if self._closed:
+            raise RuntimeError("Env is closed")
+        protocol.send_pause(self._sock)
+
+    def resume(self) -> None:
+        """Resume after a ``pause()``."""
+        if self._closed:
+            raise RuntimeError("Env is closed")
+        protocol.send_resume(self._sock)
 
     def reset(self, savestate_id: int = 0) -> StateFrame:
         """Ask Dolphin to reload a savestate.

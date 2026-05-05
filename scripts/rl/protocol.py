@@ -62,6 +62,11 @@ TAG_STATE = 0x01
 TAG_ACTION = 0x02
 TAG_RESET = 0x10
 TAG_SHUTDOWN = 0x11
+# Pause / resume the live emulator while the trainer runs a PPO update.
+# C++ side routes these through Core::QueueHostJob so they're safe to
+# trigger from the receiver thread.  See AIController.cpp::ReceiverLoop.
+TAG_PAUSE = 0x12
+TAG_RESUME = 0x13
 
 # State header format (after the 1-byte tag).  IBBHH = u32, u8, u8, u16, u16.
 _STATE_HEADER_FMT = "<IBBHH"
@@ -174,3 +179,18 @@ def pack_reset(savestate_id: int = 0) -> bytes:
 def pack_shutdown() -> bytes:
     """Pack a SHUTDOWN packet body (empty)."""
     return b""
+
+
+def send_pause(sock: socket.socket) -> None:
+    """Ask the emulator to pause until a matching ``send_resume()``.
+
+    The pause takes effect a frame or two later (host-thread-dispatched);
+    don't expect immediate freeze.  Safe to call repeatedly — extra
+    PAUSEs while already paused are no-ops on the C++ side.
+    """
+    send_packet(sock, TAG_PAUSE, b"")
+
+
+def send_resume(sock: socket.socket) -> None:
+    """Resume the emulator after a ``send_pause()``."""
+    send_packet(sock, TAG_RESUME, b"")
