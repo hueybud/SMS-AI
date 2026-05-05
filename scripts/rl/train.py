@@ -146,9 +146,14 @@ def main() -> int:
     # PPO knobs (override config defaults)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--ppo-epsilon", type=float, default=1e-2)
-    p.add_argument("--kl-teacher", type=float, default=1e-1,
-                   help="teacher KL weight; tighter than slippi's 3e-3 to "
-                        "keep policy close to BC early in training")
+    p.add_argument("--kl-teacher", type=float, default=3e-3,
+                   help="teacher KL weight, matching slippi-ai.  Lower = "
+                        "looser leash → policy free to deviate from BC "
+                        "toward reward signal.  Our BC is Rookie-level, "
+                        "so anchoring tightly to it would cap improvement "
+                        "at Rookie level; we want PPO to pull AWAY from "
+                        "the noisy BC, not stay near it.  The original "
+                        "1e-1 over-anchored and pinned the policy to BC.")
     p.add_argument("--num-epochs", type=int, default=2)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)

@@ -1,24 +1,33 @@
 """Reward function for PPO over Trajectory rollouts.
 
-Two reward sources combine into a single per-frame reward for the agent's
-perspective:
+Four reward sources combine into a single per-frame reward for the
+agent's perspective:
 
     - **Sparse — goal differential**.  ``±GOAL_REWARD`` per goal scored
       across the transition.  Zero-sum: agent's team scores → +X; their
       team scores → -X.
-    - **Dense — possession turnover, zoned**.  When prev_owner is on our
-      team and curr_owner is on theirs, apply a penalty.  Zone is decided
-      by ball x at the moment of recovery (where the opponent picked it up,
-      not where we lost it — clearing into their half is fine, getting
-      tackled in our box is not).  Goalie pickup gets a flat low penalty
-      regardless of zone (shooting is good even though most shots miss).
+    - **Dense — possession turnover, zoned, symmetric**.  Zone is decided
+      by ball x at the moment of recovery (where the new owner picked it
+      up).  Losses (we → them) are penalized; gains (them → us) are
+      rewarded.  Magnitudes are intentionally asymmetric (losses larger
+      than gains) so the policy stays cautious, but both signs exist so
+      PPO has a positive direction to climb.  Goalie pickups get a flat
+      small term either way.
+    - **Dense — possession holding**.  Tiny per-frame bonus when our
+      team holds the ball.  Gives PPO a non-zero gradient on quiet
+      rollouts where no events fire.
+    - **Dense — shot attempts**.  Fires when one of our strikers enters
+      a shot action state (eFielderActionState ∈ {0x05, 0x07, 0x08,
+      0x11, 0x12}).  Counter-balances the goalie-pickup penalty so the
+      AI learns to shoot, not to avoid shooting.  Detection is purely
+      state-driven, not velocity-heuristic.
 
 Reset boundaries are handled carefully: the **goal** signal is preserved
 across a reset boundary (the gap between our last in-play frame and the
 post-celebration kickoff is the goal celebration; score deltas there are
-real), but the **possession** signal is skipped (kickoff resets the ball
-to a goalie regardless of pre-celebration state, which would otherwise
-look like a turnover).
+real), but the **possession** / **shot** signals are skipped (kickoff
+resets the ball to a goalie and re-poses everyone, which would otherwise
+look like spurious turnovers + state transitions).
 
 All numbers are file-top constants — iterate by editing here, no code dive.
 
@@ -37,19 +46,50 @@ from .trajectory import Trajectory
 
 # ── Tunable reward weights ───────────────────────────────────────────────────
 
-# Sparse: per goal.  Symmetric — +X for us, -X for them.  Big to dominate
-# the dense shaping signal in the long run; PPO normalizes advantages so
-# absolute scale only matters relative to the dense terms below.
-GOAL_REWARD = 10.0
+# All magnitudes are scaled around a goal terminal of ±1.0 (slippi-ai
+# style) so the numbers read cleanly as fractions of "scored a goal".
+# Absolute scale doesn't affect PPO learning — advantages are normalized
+# in the learner — but the smaller numbers are easier to eyeball in logs.
 
-# Dense: possession turnover penalties.  Applied only on a true loss
-# (prev_owner on our team, curr_owner on theirs).  No counter-bonus for
-# us recovering — keep the signal one-sided to bias toward keeping the ball;
-# add the symmetric reward later if play feels too passive in defense.
-LOSS_TO_OPPONENT_DEFENSIVE_THIRD = -2.0   # they recover near our goal — bad
-LOSS_TO_OPPONENT_MIDDLE_THIRD    = -1.0
-LOSS_TO_OPPONENT_ATTACKING_THIRD = -0.3   # we cleared deep, they recovered far — fine
-LOSS_TO_OPPONENT_GOALIE          = -0.3   # goalie pickup regardless of zone
+# Sparse: per goal.  Symmetric — +X for us, -X for them.  Anchored at
+# 1.0 so every other term reads as a fraction of "scored a goal".
+GOAL_REWARD = 1.0
+
+# Dense: possession turnover penalties.  Applied on a true loss
+# (prev_owner on our team, curr_owner on theirs).  Zoned by ball x at
+# recovery.
+LOSS_TO_OPPONENT_DEFENSIVE_THIRD = -0.20   # they recover near our goal — bad
+LOSS_TO_OPPONENT_MIDDLE_THIRD    = -0.10
+LOSS_TO_OPPONENT_ATTACKING_THIRD = -0.03   # we cleared deep, they recovered far — fine
+# The goalie-pickup case overlaps with shot attempts (most shots end in
+# goalie pickup).  With SHOT_REWARD now firing on shot state entry, a
+# successful shot net-rewards the AI; this small term still penalizes
+# weak passes that wander into the goalie's hands without any shot intent.
+LOSS_TO_OPPONENT_GOALIE          = -0.01
+
+# Dense: possession turnover GAINS — mirror of the loss terms.  Without
+# these, every reward in the function is ≤ 0 and PPO's optimal policy is
+# "minimize event count" → don't engage, don't shoot, sit still.  Magnitudes
+# are smaller than the matching losses so the policy stays defensively
+# biased, but the positive signal lets it actually learn what to do.
+GAIN_FROM_OPPONENT_DEFENSIVE_THIRD = +0.03   # we recovered deep in our half — relief
+GAIN_FROM_OPPONENT_MIDDLE_THIRD    = +0.07
+GAIN_FROM_OPPONENT_ATTACKING_THIRD = +0.15   # we tackled them in their box — great
+GAIN_FROM_OPPONENT_GOALIE          = +0.01   # opponent goalie released, we picked up
+
+# Dense: per-frame possession holding bonus.  Tiny on purpose — at 240
+# frames/rollout, holding the ball the entire rollout is +0.06 (well
+# below a single goal terminal at ±1.0).  The point is to give PPO a
+# non-zero gradient on every frame so quiet rollouts aren't all-zero
+# advantages.
+POSSESSION_BONUS_PER_FRAME = +0.00025
+
+# Dense: shot attempt — fires once when one of our strikers enters a
+# shot action state from a non-shot state.  State-driven (not velocity
+# heuristic): the carrier's eFielderActionState transitions into the
+# shot animation when the player commits to a shot.
+SHOT_REWARD = +0.05
+SHOT_STATES = frozenset({0x05, 0x07, 0x08, 0x11, 0x12})
 
 # Field geometry — agent's mirrored frame so +X = their goal, -X = our goal.
 # goal_x ≈ 38 in feature units for standard Strikers stadiums; the field
@@ -90,6 +130,38 @@ def _zone_penalty_for(ball_x: float) -> float:
     return LOSS_TO_OPPONENT_ATTACKING_THIRD
 
 
+def _zone_gain_for(ball_x: float) -> float:
+    """Zoned reward for our striker recovery at ``ball_x`` — mirror of
+    ``_zone_penalty_for``."""
+    if ball_x < DEF_THIRD_BOUNDARY:
+        return GAIN_FROM_OPPONENT_DEFENSIVE_THIRD
+    if ball_x < ATK_THIRD_BOUNDARY:
+        return GAIN_FROM_OPPONENT_MIDDLE_THIRD
+    return GAIN_FROM_OPPONENT_ATTACKING_THIRD
+
+
+# Feature offsets for the four friendly-striker state indices.  These
+# mirror AIController::ReadGameStateCore exactly:
+#   - Self block (19 floats) starts at index 22, state_idx at 25
+#   - Friendly1 (7 floats) at 41-47, state_idx at 44
+#   - Friendly2 (7 floats) at 48-54, state_idx at 51
+#   - Friendly3 (7 floats) at 55-61, state_idx at 58
+# StrikerStateIdx in AIController.cpp returns the float index into
+# STRIKER_VOCAB, which is identity for 0x00..0x1B.  So feature value
+# 5.0 == state 0x05 etc., and we can compare against SHOT_STATES (the
+# raw byte set) directly after rounding.
+_OUR_STRIKER_STATE_OFFSETS = (25, 44, 51, 58)
+
+
+def _our_striker_states(state: StateFrame) -> tuple:
+    """Return (s0, s1, s2, s3) — the action state byte for each of our
+    four strikers, decoded from the float feature indices.  Empty/unknown
+    blocks register as 0 (non-shot state) and are harmless.
+    """
+    f = state.core_features
+    return tuple(int(round(float(f[i]))) for i in _OUR_STRIKER_STATE_OFFSETS)
+
+
 def compute(traj: Trajectory) -> np.ndarray:
     """Per-frame reward array of shape ``(T,)`` aligned with ``traj.actions``.
 
@@ -107,6 +179,7 @@ def compute(traj: Trajectory) -> np.ndarray:
         opp_goalie  = RIGHT_GOALIE_SLOT
 
     rewards = np.zeros(T, dtype=np.float32)
+    our_goalie = LEFT_GOALIE_SLOT if not traj.mirror_x else RIGHT_GOALIE_SLOT
 
     for t in range(T):
         s_t  = traj.states[t]
@@ -125,21 +198,56 @@ def compute(traj: Trajectory) -> np.ndarray:
             their_delta = int(s_t1.score_right) - int(s_t.score_right)
         rewards[t] += GOAL_REWARD * float(our_delta - their_delta)
 
-        # ── Possession turnover (dense) ─────────────────────────────────────
-        # Skip across reset boundaries: at a kickoff the ball goes to a
-        # goalie regardless of pre-celebration state, which would falsely
-        # look like a turnover.
+        # ── Reset boundary gate ─────────────────────────────────────────────
+        # Skip dense shaping across kickoffs: ball is repositioned,
+        # everyone re-poses, action states reset.  Anything we'd compute
+        # here (turnovers, shot transitions, possession) would be
+        # spurious.  The goal differential above already fired for any
+        # real score change in the celebration gap.
         if is_reset:
             continue
 
         prev_owner = _owner_slot(s_t)
         curr_owner = _owner_slot(s_t1)
+
+        # ── Possession holding (dense, every frame) ─────────────────────────
+        # Tiny bonus while our team has the ball.  Goalie counts — them
+        # holding the ball is still our possession.  Without this the
+        # AI gets reward=0 on most frames and learns nothing from quiet
+        # play; with it, every frame contributes a small gradient.
+        if curr_owner in ours:
+            rewards[t] += POSSESSION_BONUS_PER_FRAME
+
+        # ── Possession turnover events ──────────────────────────────────────
+        # Loss: ours → theirs.
         if prev_owner in ours and curr_owner in theirs:
             if curr_owner == opp_goalie:
                 rewards[t] += LOSS_TO_OPPONENT_GOALIE
             else:
                 ball_x = float(s_t1.core_features[0])  # mirrored: +X = their goal
                 rewards[t] += _zone_penalty_for(ball_x)
+        # Gain: theirs → ours.  Mirror of the loss case.
+        elif prev_owner in theirs and curr_owner in ours:
+            if curr_owner == our_goalie:
+                rewards[t] += GAIN_FROM_OPPONENT_GOALIE
+            else:
+                ball_x = float(s_t1.core_features[0])
+                rewards[t] += _zone_gain_for(ball_x)
+
+        # ── Shot attempt (dense, state-driven) ──────────────────────────────
+        # Fires once per shot when any of our strikers enters a shot
+        # action state from a non-shot state.  Counter-balances
+        # LOSS_TO_OPPONENT_GOALIE so a goalie-saved shot still nets
+        # positive (we tried).  We don't restrict to the carrier's
+        # block — only the carrier ever transitions into a shot state
+        # in normal play, so checking all four blocks is robust to the
+        # exact frame where ball_owner_ptr clears.
+        prev_states = _our_striker_states(s_t)
+        curr_states = _our_striker_states(s_t1)
+        for ps, cs in zip(prev_states, curr_states):
+            if cs in SHOT_STATES and ps not in SHOT_STATES:
+                rewards[t] += SHOT_REWARD
+                break
 
     return rewards
 
