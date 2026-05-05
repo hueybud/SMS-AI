@@ -25,6 +25,7 @@ vs whatever CPU you set up.  Press Ctrl+C to save final weights and exit.
 from __future__ import annotations
 
 import argparse
+import csv
 import socket
 import sys
 import time
@@ -157,6 +158,13 @@ def main() -> int:
                         "rollout through one SDPA per layer (default, "
                         "slippi-ai-style); 'loop' is the original 240-frame "
                         "Python loop kept for fallback / debugging")
+    p.add_argument("--pause-on-update", action="store_true",
+                   help="Freeze the live game across PPO updates so "
+                        "opponents can't score against a held-action AI "
+                        "during the wall-clock gap.  Recommended on CPU "
+                        "(updates take ~6s); unnecessary on GPU (updates "
+                        "are sub-second).  Routed via Core::QueueHostJob "
+                        "on the C++ side — see AIController.cpp.")
     args = p.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -189,6 +197,7 @@ def main() -> int:
         replay_mode=args.replay_mode,
     )
     print(f"[train] replay_mode={args.replay_mode}")
+    print(f"[train] pause_on_update={args.pause_on_update}")
     learner = PPOLearner(
         policy=policy,
         teacher=teacher,
@@ -233,6 +242,32 @@ def main() -> int:
         log_f = open(log_path, "a", encoding="utf-8", buffering=1)
         log_f.write(f"\n=== train start {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
+        # CSV metrics dump — one row per rollout, append-mode so multiple
+        # runs in the same run_dir concatenate.  rl/plot_metrics.py reads
+        # this and produces metrics.png.  Same idea as the BC training
+        # CSV/PNG: avoids combing log lines to gauge progress.
+        csv_path = run_dir / "metrics.csv"
+        csv_is_new = not csv_path.exists()
+        csv_f = open(csv_path, "a", encoding="utf-8", newline="", buffering=1)
+        csv_w = csv.writer(csv_f)
+        csv_columns = [
+            "wallclock", "rollout", "total_frames", "update_tag",
+            "collect_s", "update_s",
+            "reward_sum", "reward_events",
+            "adv_mean", "adv_std",
+            "score_left", "score_right",
+            "loss_total", "loss_ppo", "loss_value", "loss_kl_teacher",
+            "loss_entropy", "rho_mean", "log_rho_abs_max", "grad_norm",
+            "act_avg_ms", "act_max_ms", "unique_actions", "actions_total",
+            "drained_states",
+        ]
+        if csv_is_new:
+            csv_w.writerow(csv_columns)
+            print(f"[train] metrics csv -> {csv_path}")
+        else:
+            print(f"[train] metrics csv (appending) -> {csv_path}")
+        run_t0 = time.monotonic()
+
         # Trajectory batch — we accumulate ``--batch-rollouts`` rollouts before
         # running a single PPO update over the union.  Why batch:
         #  - Single-rollout updates on a rare goal-against rollout assign
@@ -261,8 +296,18 @@ def main() -> int:
                 init_pl = agent.snapshot_prev_labels()
 
                 t_collect_start = time.monotonic()
+                # Diagnostic: time per agent.act() to see whether RL inference
+                # is slower than 60fps (= 16.7 ms/frame); track unique actions
+                # produced to confirm Gumbel sampling actually varies; track
+                # drained STATE packets (= game frames not in trajectory)
+                # so we can see how aggressive the drain is being.
+                _act_times: list = []
+                _seen_actions: set = set()
+                _drained_at_start = env.drained_states
                 while not buffer.is_full():
+                    _t0 = time.monotonic()
                     out = agent.act(state)
+                    _act_times.append(time.monotonic() - _t0)
                     buffer.push_action(
                         action_idx=out["action_idx"],
                         stick_bin_idx=out["stick_bin_idx"],
@@ -271,10 +316,38 @@ def main() -> int:
                         log_prob=out["log_prob"],
                         value=out["value"],
                     )
+                    # Sample a tag for uniqueness check (action_idx + 4 stick bins).
+                    _seen_actions.add(
+                        (int(out["action_idx"]),
+                         tuple(int(b) for b in out["stick_bin_idx"]))
+                    )
+                    # Log every 60th action to show what Python is actually
+                    # sending and the frame_id we echoed back to C++.
+                    if (total_frames % 60) == 0:
+                        print(
+                            f"[diag] act #{total_frames} frame_id={state.frame_id} "
+                            f"action_idx={int(out['action_idx'])} "
+                            f"stick_bins={list(int(b) for b in out['stick_bin_idx'])} "
+                            f"btn_flags={out['btn_flags'].astype(int).tolist()} "
+                            f"stick_vals={[round(float(v), 3) for v in out['stick_vals']]}",
+                            flush=True,
+                        )
                     state = env.step(state.frame_id, out["btn_flags"], out["stick_vals"])
                     buffer.push_state(state)
                     total_frames += 1
                 t_collect = time.monotonic() - t_collect_start
+                _act_avg = sum(_act_times) / max(len(_act_times), 1)
+                _act_max = max(_act_times) if _act_times else 0.0
+                _drained_this_rollout = env.drained_states - _drained_at_start
+                print(
+                    f"[diag] rollout {rollout_idx} "
+                    f"act_avg={_act_avg * 1000:.1f}ms "
+                    f"act_max={_act_max * 1000:.1f}ms "
+                    f"unique_actions={len(_seen_actions)}/{len(_act_times)} "
+                    f"drained_states={_drained_this_rollout} "
+                    f"(>16.7ms means we lag 60fps; drained=skipped game frames)",
+                    flush=True,
+                )
 
                 traj = buffer.finalize(
                     mirror_x=mirror_x,
@@ -310,7 +383,22 @@ def main() -> int:
                     )
                     t_update_start = time.monotonic()
                     if batch_events > 0:
-                        metrics = learner.update(batch_trajs)
+                        # Pause the live game across the update so the AI
+                        # doesn't keep holding its last action while
+                        # opponents pile on goals — those goals would get
+                        # mis-attributed to the next rollout's actions.
+                        # Skipped on null batches because there's nothing
+                        # to learn anyway and the update returns instantly.
+                        # try/finally so a Python crash mid-update still
+                        # resumes the game (and the C++ side has its own
+                        # auto-resume on connection drop as a backstop).
+                        if args.pause_on_update:
+                            env.pause()
+                        try:
+                            metrics = learner.update(batch_trajs)
+                        finally:
+                            if args.pause_on_update:
+                                env.resume()
                         update_tag = "UPD"
                     else:
                         update_tag = "skp"
@@ -333,6 +421,34 @@ def main() -> int:
                 )
                 print(line, flush=True)
                 log_f.write(line + "\n")
+
+                csv_w.writerow([
+                    f"{time.monotonic() - run_t0:.2f}",
+                    rollout_idx - 1,
+                    total_frames,
+                    update_tag,
+                    f"{t_collect:.3f}",
+                    f"{t_update:.3f}",
+                    f"{rstats['sum']:.4f}",
+                    rstats["n_events"],
+                    f"{float(traj.advantages.mean()):.4f}",
+                    f"{float(traj.advantages.std()):.4f}",
+                    state.score_left,
+                    state.score_right,
+                    f"{metrics['loss/total']:.4f}",
+                    f"{metrics['loss/ppo_obj']:.4f}",
+                    f"{metrics['loss/value']:.4f}",
+                    f"{metrics['loss/kl_teacher']:.4f}",
+                    f"{metrics['loss/entropy']:.4f}",
+                    f"{metrics['rho/mean']:.4f}",
+                    f"{metrics['log_rho/abs_max']:.4f}",
+                    f"{metrics['grad_norm']:.4f}",
+                    f"{_act_avg * 1000:.2f}",
+                    f"{_act_max * 1000:.2f}",
+                    len(_seen_actions),
+                    len(_act_times),
+                    _drained_this_rollout,
+                ])
 
                 # Periodic checkpoint.
                 if args.save_every > 0 and rollout_idx % args.save_every == 0:
@@ -363,6 +479,7 @@ def main() -> int:
                 f"=== train end rollout={rollout_idx} frames={total_frames} ===\n"
             )
             log_f.close()
+            csv_f.close()
 
     return 0
 
