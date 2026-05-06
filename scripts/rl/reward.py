@@ -13,9 +13,12 @@ agent's perspective:
       than gains) so the policy stays cautious, but both signs exist so
       PPO has a positive direction to climb.  Goalie pickups get a flat
       small term either way.
-    - **Dense — possession holding**.  Tiny per-frame bonus when our
-      team holds the ball.  Gives PPO a non-zero gradient on quiet
-      rollouts where no events fire.
+    - **Dense — possession progress**.  Per-frame bonus proportional to
+      forward ball motion (+X = toward opponent goal) while one of our
+      strikers has the ball.  Goalie possession is excluded — the
+      goalie isn't really playing.  Replaced an earlier static
+      possession bonus that the AI exploited by running into a wall to
+      pin the ball and farm the constant signal.
     - **Dense — shot attempts**.  Fires when one of our strikers enters
       a shot action state (eFielderActionState ∈ {0x05, 0x07, 0x08,
       0x11, 0x12}).  Counter-balances the goalie-pickup penalty so the
@@ -77,12 +80,20 @@ GAIN_FROM_OPPONENT_MIDDLE_THIRD    = +0.07
 GAIN_FROM_OPPONENT_ATTACKING_THIRD = +0.15   # we tackled them in their box — great
 GAIN_FROM_OPPONENT_GOALIE          = +0.01   # opponent goalie released, we picked up
 
-# Dense: per-frame possession holding bonus.  Tiny on purpose — at 240
-# frames/rollout, holding the ball the entire rollout is +0.06 (well
-# below a single goal terminal at ±1.0).  The point is to give PPO a
-# non-zero gradient on every frame so quiet rollouts aren't all-zero
-# advantages.
-POSSESSION_BONUS_PER_FRAME = +0.00025
+# Dense: possession progress.  Rewards forward ball motion (+X = toward
+# opponent goal) while one of our STRIKERS has the ball — explicitly
+# not when our goalie has it (the goalie isn't really playing the
+# game, just holding the ball).  Replaced an earlier static per-frame
+# possession bonus that was reward-hackable: the AI learned to run
+# into a wall holding the ball and farm the constant bonus risk-free.
+# Progress-based shaping makes wall-hugging earn 0 while dribbling
+# forward earns the credit.  max(0, Δ) — backward passes are sometimes
+# tactically correct (reset, switch field), so they earn zero rather
+# than negative.
+#
+# Magnitude: ~0.001 per ball-x unit advanced.  Walking forward 2s
+# (~18 units) ≈ +0.018; full-field clear (76 units) ≈ +0.08.
+POSSESSION_PROGRESS_PER_UNIT = +0.001
 
 # Dense: shot attempt — fires once when one of our strikers enters a
 # shot action state from a non-shot state.  State-driven (not velocity
@@ -210,13 +221,18 @@ def compute(traj: Trajectory) -> np.ndarray:
         prev_owner = _owner_slot(s_t)
         curr_owner = _owner_slot(s_t1)
 
-        # ── Possession holding (dense, every frame) ─────────────────────────
-        # Tiny bonus while our team has the ball.  Goalie counts — them
-        # holding the ball is still our possession.  Without this the
-        # AI gets reward=0 on most frames and learns nothing from quiet
-        # play; with it, every frame contributes a small gradient.
-        if curr_owner in ours:
-            rewards[t] += POSSESSION_BONUS_PER_FRAME
+        # ── Possession progress (dense) ─────────────────────────────────────
+        # Forward ball motion while one of our STRIKERS holds the ball
+        # (not goalie — the goalie isn't really playing, just holding).
+        # Earlier design rewarded static possession every frame; the AI
+        # exploited it by running into a wall, pinning the ball, and
+        # farming the bonus risk-free.  Progress shaping makes the wall
+        # hack earn nothing.  max(0, Δ) — backward moves are zero, not
+        # negative, so tactical retreats aren't punished.
+        if curr_owner in ours and curr_owner != our_goalie:
+            bpx_t  = float(s_t.core_features[0])
+            bpx_t1 = float(s_t1.core_features[0])
+            rewards[t] += POSSESSION_PROGRESS_PER_UNIT * max(0.0, bpx_t1 - bpx_t)
 
         # ── Possession turnover events ──────────────────────────────────────
         # Loss: ours → theirs.
