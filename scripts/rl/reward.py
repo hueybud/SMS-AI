@@ -144,7 +144,7 @@ STAGNATION_MIN_ADVANCE = 0.5
 # rate so the AI can't break even by alternating brief backward runs with
 # forward walks.  The gate means it's safe to loosen compared to a blanket
 # backward penalty.
-BACKWARD_UNCONTESTED_PROXIMITY        = 12.0   # units (2D from nearest defender)
+BACKWARD_UNCONTESTED_PROXIMITY        = 5.0    # units (2D from nearest defender)
 BACKWARD_UNCONTESTED_PENALTY_PER_UNIT = -0.002
 
 # Dense: shot attempt — fires once when one of our strikers enters a
