@@ -134,6 +134,12 @@ POSSESSION_PROGRESS_PER_UNIT = +0.001
 # alternating backward-stall and forward-walk.
 STAGNATION_GRACE_FRAMES      = 120
 STAGNATION_PENALTY_PER_FRAME = -0.0003
+# Minimum ball-x advance required to reset the stagnation counter.
+# Without this, side-wall physics jitter (~0.01–0.1 units per frame)
+# constantly resets stagnation_frames to zero before the grace period
+# expires, so wall-camping never triggers the penalty.  Set to 0.5 units
+# — unmistakable forward progress, invisible to normal dribbling.
+STAGNATION_MIN_ADVANCE = 0.5
 
 # Dense: shot attempt — fires once when one of our strikers enters a
 # shot action state from a non-shot state, AND that specific striker
@@ -387,7 +393,7 @@ class RewardComputer:
                 self._emit("POSS_PROGRESS", self._poss_progress_bucket)
                 self._poss_progress_bucket = 0.0
 
-            if self._best_x_streak is None or bpx_t1 > self._best_x_streak:
+            if self._best_x_streak is None or bpx_t1 > self._best_x_streak + STAGNATION_MIN_ADVANCE:
                 self._best_x_streak = bpx_t1
                 self._stagnation_frames = 0
             else:

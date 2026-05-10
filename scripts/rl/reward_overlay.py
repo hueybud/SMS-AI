@@ -42,7 +42,7 @@ from collections import defaultdict, deque
 from datetime import datetime
 
 
-RECENT_WINDOW_SECS = 5.0
+RECENT_WINDOW_SECS = 10.0
 RECENT_MAX_ROWS    = 30
 REFRESH_MS         = 100
 
