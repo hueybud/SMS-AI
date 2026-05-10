@@ -250,6 +250,16 @@ _THEIR_STRIKER_STATE_OFFSETS = (69, 76, 83, 90)
 _THEIR_STRIKER_DX_OFFSETS    = (66, 73, 80, 87)
 
 
+def _anyone_shooting(states_tuple: tuple, xs_tuple: tuple, side_gate) -> bool:
+    """True if any striker in the given block is in a shot state on the
+    correct side of the field.  Sort-order invariant: we check PRESENCE of
+    a shot-state striker, not per-slot transitions."""
+    return any(
+        cs in SHOT_STATES and side_gate(sx)
+        for cs, sx in zip(states_tuple, xs_tuple)
+    )
+
+
 def _our_striker_states(state: StateFrame) -> tuple:
     """Return (s0, s1, s2, s3) — the action state byte for each of our
     four strikers, decoded from the float feature indices.  Empty/unknown
@@ -284,207 +294,147 @@ def _their_striker_xs(state: StateFrame) -> tuple:
     return tuple(bpx + float(f[i]) for i in _THEIR_STRIKER_DX_OFFSETS)
 
 
-def compute(traj: Trajectory, event_sink: EventSink = None) -> np.ndarray:
-    """Per-frame reward array of shape ``(T,)`` aligned with ``traj.actions``.
+class RewardComputer:
+    """Stateful per-frame reward computer.
 
-    ``rewards[t]`` rewards the transition ``(s_t, a_t, s_{t+1})``.
+    Carries the cross-frame tracking state (last ball owner, stagnation
+    high-water mark, possession-progress bucket) so rewards can be
+    computed one frame at a time — enabling real-time event emission to
+    the overlay instead of batch emission at rollout end.
 
-    If ``event_sink`` is provided, it's called as ``sink(component, value)``
-    for each non-zero reward event so a debug overlay can display the
-    component-level breakdown live.  Aggregation into ``rewards[t]`` is
-    unchanged — the sink is purely observational.
+    Typical usage in the collection loop::
+
+        rc = RewardComputer(mirror_x, event_sink=reward_event_sink)
+        for each frame:
+            s_t = state
+            state = env.step(...)
+            rollout_rewards.append(rc.step(s_t, state, state.reset_context))
+        rc.flush()                          # drain poss-progress bucket
+        traj.rewards = np.array(rollout_rewards, dtype=np.float32)
+
+    ``compute()`` below is a thin wrapper around this class for batch use
+    (replay, unit tests, etc.).
     """
-    def _emit(name: str, value: float) -> None:
-        if event_sink is not None and value != 0.0:
-            event_sink(name, float(value))
-    T = traj.length
 
-    if traj.mirror_x:
-        ours        = RIGHT_TEAM_SLOTS
-        theirs      = LEFT_TEAM_SLOTS
-        opp_goalie  = LEFT_GOALIE_SLOT
-    else:
-        ours        = LEFT_TEAM_SLOTS
-        theirs      = RIGHT_TEAM_SLOTS
-        opp_goalie  = RIGHT_GOALIE_SLOT
+    def __init__(self, mirror_x: bool, event_sink: EventSink = None) -> None:
+        if mirror_x:
+            self._ours       = RIGHT_TEAM_SLOTS
+            self._theirs     = LEFT_TEAM_SLOTS
+            self._opp_goalie = LEFT_GOALIE_SLOT
+            self._our_goalie = RIGHT_GOALIE_SLOT
+        else:
+            self._ours       = LEFT_TEAM_SLOTS
+            self._theirs     = RIGHT_TEAM_SLOTS
+            self._opp_goalie = RIGHT_GOALIE_SLOT
+            self._our_goalie = LEFT_GOALIE_SLOT
 
-    rewards = np.zeros(T, dtype=np.float32)
-    our_goalie = LEFT_GOALIE_SLOT if not traj.mirror_x else RIGHT_GOALIE_SLOT
+        self._mirror_x = mirror_x
+        self._sink = event_sink
 
-    # Bucketed POSS_PROGRESS emit (display only — rewards[t] is unchanged).
-    poss_progress_bucket = 0.0
+        self._last_owner_team: Optional[str] = None
+        self._initialized = False          # seed last_owner_team on first step
+        self._best_x_streak: Optional[float] = None
+        self._stagnation_frames: int = 0
+        self._poss_progress_bucket: float = 0.0
 
-    # Stagnation tracker.  Active only while one of our STRIKERS holds
-    # the ball (goalie excluded, matching POSSESSION_PROGRESS).  Resets
-    # on any change away from striker possession (loose, opponent, our
-    # goalie) and on kickoff resets.
-    best_x_streak: Optional[float] = None
-    stagnation_frames = 0
+    def _emit(self, name: str, value: float) -> None:
+        if self._sink is not None and value != 0.0:
+            self._sink(name, float(value))
 
-    # Track the last team that ACTUALLY owned the ball — not just the
-    # previous frame's owner.  Many real possession events go through a
-    # loose-ball intermediary: a clear (us → loose → them later), a
-    # hit-recovery (them → loose → us picking up).  Adjacent-frame
-    # detection misses those entirely.  This tracker stays unchanged
-    # while the ball is loose (slot == NO_OWNER_SLOT), so an event
-    # fires whenever ownership lands on a player from the opposite
-    # team, regardless of how many loose frames sat in between.
-    #
-    # Initialized from the trajectory's first state.  Reset to None on
-    # is_resetting boundaries below — kickoff repositions everyone and
-    # the pre-reset team identity is no longer relevant.
-    initial_owner = _owner_slot(traj.states[0])
-    if initial_owner in ours:
-        last_owner_team = "ours"
-    elif initial_owner in theirs:
-        last_owner_team = "theirs"
-    else:
-        last_owner_team = None  # ball started loose
+    def step(self, s_t: StateFrame, s_t1: StateFrame, is_resetting: bool) -> float:
+        """Compute reward for one transition (s_t → s_t1). Returns scalar."""
+        reward = 0.0
 
-    for t in range(T):
-        s_t  = traj.states[t]
-        s_t1 = traj.states[t + 1]
-        is_reset = bool(traj.is_resetting[t + 1])
+        # Seed last_owner_team from the first s_t we see.
+        if not self._initialized:
+            owner0 = _owner_slot(s_t)
+            if owner0 in self._ours:
+                self._last_owner_team = "ours"
+            elif owner0 in self._theirs:
+                self._last_owner_team = "theirs"
+            self._initialized = True
 
         # ── Goal events (sparse) ────────────────────────────────────────────
-        # Always credited.  Score changes that happen during a goal-
-        # celebration gap (no STATE packets, then a reset frame on the
-        # next kickoff) need to land on the action that led to the goal.
-        if traj.mirror_x:
+        if self._mirror_x:
             our_delta   = int(s_t1.score_right) - int(s_t.score_right)
             their_delta = int(s_t1.score_left)  - int(s_t.score_left)
         else:
             our_delta   = int(s_t1.score_left)  - int(s_t.score_left)
             their_delta = int(s_t1.score_right) - int(s_t.score_right)
-        goal_reward = GOAL_REWARD * float(our_delta - their_delta)
-        rewards[t] += goal_reward
+        reward += GOAL_REWARD * float(our_delta - their_delta)
         if our_delta:
-            _emit("GOAL_FOR",     GOAL_REWARD * our_delta)
+            self._emit("GOAL_FOR",     GOAL_REWARD * our_delta)
         if their_delta:
-            _emit("GOAL_AGAINST", -GOAL_REWARD * their_delta)
+            self._emit("GOAL_AGAINST", -GOAL_REWARD * their_delta)
 
         # ── Reset boundary gate ─────────────────────────────────────────────
-        # Skip dense shaping across kickoffs: ball is repositioned,
-        # everyone re-poses, action states reset.  Anything we'd compute
-        # here (turnovers, shot transitions, possession) would be
-        # spurious.  The goal differential above already fired for any
-        # real score change in the celebration gap.  Forget the
-        # last-owner tracker too — the pre-reset team identity is no
-        # longer meaningful for post-reset possession events.
-        if is_reset:
-            last_owner_team = None
-            best_x_streak = None
-            stagnation_frames = 0
-            continue
+        if is_resetting:
+            self._last_owner_team = None
+            self._best_x_streak = None
+            self._stagnation_frames = 0
+            return reward
 
         curr_owner = _owner_slot(s_t1)
 
-        # ── Possession progress (dense) ─────────────────────────────────────
-        # Forward ball motion while one of our STRIKERS holds the ball
-        # (not goalie — the goalie isn't really playing, just holding).
-        # Earlier design rewarded static possession every frame; the AI
-        # exploited it by running into a wall, pinning the ball, and
-        # farming the bonus risk-free.  Progress shaping makes the wall
-        # hack earn nothing.  max(0, Δ) — backward moves are zero, not
-        # negative, so tactical retreats aren't punished.
-        if curr_owner in ours and curr_owner != our_goalie:
+        # ── Possession progress + stagnation (dense) ────────────────────────
+        if curr_owner in self._ours and curr_owner != self._our_goalie:
             bpx_t  = float(s_t.core_features[0])
             bpx_t1 = float(s_t1.core_features[0])
             progress = POSSESSION_PROGRESS_PER_UNIT * max(0.0, bpx_t1 - bpx_t)
-            rewards[t] += progress
-            poss_progress_bucket += progress
-            if poss_progress_bucket >= POSS_PROGRESS_EMIT_THRESHOLD:
-                _emit("POSS_PROGRESS", poss_progress_bucket)
-                poss_progress_bucket = 0.0
+            reward += progress
+            self._poss_progress_bucket += progress
+            if self._poss_progress_bucket >= POSS_PROGRESS_EMIT_THRESHOLD:
+                self._emit("POSS_PROGRESS", self._poss_progress_bucket)
+                self._poss_progress_bucket = 0.0
 
-            # ── Stagnation (dense) ──────────────────────────────────
-            # Track ball-x high-water mark across the current striker
-            # possession streak.  A new max resets the counter; failing
-            # to advance for more than GRACE_FRAMES starts charging
-            # STAGNATION_PENALTY_PER_FRAME every additional frame.
-            if best_x_streak is None or bpx_t1 > best_x_streak:
-                best_x_streak = bpx_t1
-                stagnation_frames = 0
+            if self._best_x_streak is None or bpx_t1 > self._best_x_streak:
+                self._best_x_streak = bpx_t1
+                self._stagnation_frames = 0
             else:
-                stagnation_frames += 1
-                if stagnation_frames > STAGNATION_GRACE_FRAMES:
-                    rewards[t] += STAGNATION_PENALTY_PER_FRAME
-                    _emit("STAGNATION", STAGNATION_PENALTY_PER_FRAME)
+                self._stagnation_frames += 1
+                if self._stagnation_frames > STAGNATION_GRACE_FRAMES:
+                    reward += STAGNATION_PENALTY_PER_FRAME
+                    self._emit("STAGNATION", STAGNATION_PENALTY_PER_FRAME)
         else:
-            # Possession ended (loose ball, opponent, or our goalie) —
-            # streak resets so the next striker pickup gets a fresh
-            # grace window from a fresh high-water mark.
-            best_x_streak = None
-            stagnation_frames = 0
+            self._best_x_streak = None
+            self._stagnation_frames = 0
 
-        # ── Possession turnover events (loose-ball-aware) ──────────────────
-        # Compares the new owner's team against the LAST team to actually
-        # hold the ball, ignoring any loose-ball gap in between.  This
-        # captures clears (us → loose → them) and hit-recoveries (them →
-        # loose → us) — common in Strikers, especially defensively after
-        # a body-check or slide knocks the ball loose.
-        if curr_owner in ours and last_owner_team == "theirs":
-            # Gain: their team last had it, now we do.
-            if curr_owner == our_goalie:
-                rewards[t] += GAIN_FROM_OPPONENT_GOALIE
-                _emit("GAIN_GOALIE", GAIN_FROM_OPPONENT_GOALIE)
+        # ── Possession turnover events (loose-ball-aware) ───────────────────
+        if curr_owner in self._ours and self._last_owner_team == "theirs":
+            if curr_owner == self._our_goalie:
+                reward += GAIN_FROM_OPPONENT_GOALIE
+                self._emit("GAIN_GOALIE", GAIN_FROM_OPPONENT_GOALIE)
             else:
                 ball_x = float(s_t1.core_features[0])
                 gain = _zone_gain_for(ball_x)
-                rewards[t] += gain
+                reward += gain
                 if ball_x < DEF_THIRD_BOUNDARY:
-                    _emit("GAIN_DEF_THIRD", gain)
+                    self._emit("GAIN_DEF_THIRD", gain)
                 elif ball_x < ATK_THIRD_BOUNDARY:
-                    _emit("GAIN_MID_THIRD", gain)
+                    self._emit("GAIN_MID_THIRD", gain)
                 else:
-                    _emit("GAIN_ATK_THIRD", gain)
-        elif curr_owner in theirs and last_owner_team == "ours":
-            # Loss: we last had it, now they do.
-            if curr_owner == opp_goalie:
-                rewards[t] += LOSS_TO_OPPONENT_GOALIE
-                _emit("LOSS_GOALIE", LOSS_TO_OPPONENT_GOALIE)
+                    self._emit("GAIN_ATK_THIRD", gain)
+        elif curr_owner in self._theirs and self._last_owner_team == "ours":
+            if curr_owner == self._opp_goalie:
+                reward += LOSS_TO_OPPONENT_GOALIE
+                self._emit("LOSS_GOALIE", LOSS_TO_OPPONENT_GOALIE)
             else:
-                ball_x = float(s_t1.core_features[0])  # mirrored: +X = their goal
+                ball_x = float(s_t1.core_features[0])
                 loss = _zone_penalty_for(ball_x)
-                rewards[t] += loss
+                reward += loss
                 if ball_x < DEF_THIRD_BOUNDARY:
-                    _emit("LOSS_DEF_THIRD", loss)
+                    self._emit("LOSS_DEF_THIRD", loss)
                 elif ball_x < ATK_THIRD_BOUNDARY:
-                    _emit("LOSS_MID_THIRD", loss)
+                    self._emit("LOSS_MID_THIRD", loss)
                 else:
-                    _emit("LOSS_ATK_THIRD", loss)
+                    self._emit("LOSS_ATK_THIRD", loss)
 
-        # Update the tracker AFTER the event check, only when the new
-        # owner is a real player.  Loose-ball frames leave it unchanged
-        # so the next real pickup compares against the correct team.
-        if curr_owner in ours:
-            last_owner_team = "ours"
-        elif curr_owner in theirs:
-            last_owner_team = "theirs"
+        if curr_owner in self._ours:
+            self._last_owner_team = "ours"
+        elif curr_owner in self._theirs:
+            self._last_owner_team = "theirs"
 
         # ── Shot attempt (dense, state-driven, side-gated) ──────────────────
-        # Fires once per shot.  The five SHOT_STATES are also used for
-        # clearing the ball from our own half; gating on striker position
-        # (mirrored x > 0 = offensive side) separates a shot from a
-        # clear.
-        #
-        # Detection is "any offensive-side striker in a shot state this
-        # frame, and none last frame" — NOT per-slot transition checks.
-        # The striker blocks in core_features are sorted by distance to
-        # ball every frame (AIController::ReadGameStateCore section 4 /
-        # section 6), so per-slot transitions misfire whenever the sort
-        # reshuffles mid-animation: a shot-state striker moving from
-        # slot 0→1 looks like a fresh non-shot→shot transition at slot
-        # 1.  Multi-frame shot animations spammed THEIR_SHOT events for
-        # one physical shot.  The any/none formulation is sort-order
-        # invariant — only the *presence* of a shot-state striker on
-        # the offensive side matters.
-        def _anyone_shooting(states_tuple, xs_tuple, side_gate) -> bool:
-            return any(
-                cs in SHOT_STATES and side_gate(sx)
-                for cs, sx in zip(states_tuple, xs_tuple)
-            )
-
         our_prev = _anyone_shooting(_our_striker_states(s_t),
                                     _our_striker_xs(s_t),
                                     lambda x: x > 0.0)
@@ -492,13 +442,9 @@ def compute(traj: Trajectory, event_sink: EventSink = None) -> np.ndarray:
                                     _our_striker_xs(s_t1),
                                     lambda x: x > 0.0)
         if our_curr and not our_prev:
-            rewards[t] += SHOT_REWARD
-            _emit("SHOT", SHOT_REWARD)
+            reward += SHOT_REWARD
+            self._emit("SHOT", SHOT_REWARD)
 
-        # Opponent mirror: shot state on THEIR offensive side (mirrored
-        # x < 0, i.e. close to OUR goal).  Without this the shaping is
-        # asymmetric — we'd get +SHOT for trying, they'd shoot for free
-        # — and PPO can exploit the imbalance by camping in their half.
         their_prev = _anyone_shooting(_their_striker_states(s_t),
                                       _their_striker_xs(s_t),
                                       lambda x: x < 0.0)
@@ -506,14 +452,29 @@ def compute(traj: Trajectory, event_sink: EventSink = None) -> np.ndarray:
                                       _their_striker_xs(s_t1),
                                       lambda x: x < 0.0)
         if their_curr and not their_prev:
-            rewards[t] += THEIR_SHOT_REWARD
-            _emit("THEIR_SHOT", THEIR_SHOT_REWARD)
+            reward += THEIR_SHOT_REWARD
+            self._emit("THEIR_SHOT", THEIR_SHOT_REWARD)
 
-    # Drain the possession-progress bucket so the trailing remainder
-    # still surfaces in the overlay (and tally).
-    if poss_progress_bucket > 0.0:
-        _emit("POSS_PROGRESS", poss_progress_bucket)
+        return reward
 
+    def flush(self) -> None:
+        """Drain the possession-progress bucket at rollout end."""
+        if self._poss_progress_bucket > 0.0:
+            self._emit("POSS_PROGRESS", self._poss_progress_bucket)
+            self._poss_progress_bucket = 0.0
+
+
+def compute(traj: Trajectory, event_sink: EventSink = None) -> np.ndarray:
+    """Per-frame reward array of shape ``(T,)`` — thin wrapper around
+    ``RewardComputer`` for batch/replay use.  The collection loop uses
+    ``RewardComputer.step()`` directly for real-time overlay emission."""
+    rc = RewardComputer(traj.mirror_x, event_sink)
+    rewards = np.zeros(traj.length, dtype=np.float32)
+    for t in range(traj.length):
+        rewards[t] = rc.step(
+            traj.states[t], traj.states[t + 1], bool(traj.is_resetting[t + 1])
+        )
+    rc.flush()
     return rewards
 
 

@@ -7,11 +7,11 @@ Dolphin screen for live fact-checking.
 
 Layout::
 
-    Recent events (sorted by |value|, last 30 within ~5s)
+    Recent events (last 3s, newest first)
     -----------------------------------------------------
-      +0.150  GAIN_ATK_THIRD     2026-05-06 14:32:11.412
-      -0.100  LOSS_MID_THIRD     2026-05-06 14:32:08.001
-      +0.050  SHOT               2026-05-06 14:32:06.890
+      +0.050  SHOT               2026-05-06 14:32:11.412
+      +0.150  GAIN_ATK_THIRD     2026-05-06 14:32:09.001
+      -0.100  LOSS_MID_THIRD     2026-05-06 14:32:08.890
       ...
 
     Cumulative this session
@@ -68,7 +68,7 @@ class OverlayState:
         with self._lock:
             while self.recent and self.recent[0][0] < cutoff:
                 self.recent.popleft()
-            recent = sorted(self.recent, key=lambda r: -abs(r[2]))[:RECENT_MAX_ROWS]
+            recent = list(reversed(list(self.recent)))[:RECENT_MAX_ROWS]
             cumulative = sorted(
                 ((n, self.counts[n], self.totals[n]) for n in self.totals),
                 key=lambda r: -abs(r[2]),
@@ -126,7 +126,7 @@ def main() -> None:
         text.config(state="normal")
         text.delete("1.0", "end")
 
-        text.insert("end", f"Recent events (last {RECENT_WINDOW_SECS:.0f}s, |v|↓)\n", "header")
+        text.insert("end", f"Recent events (last {RECENT_WINDOW_SECS:.0f}s, newest↑)\n", "header")
         text.insert("end", "-" * 48 + "\n", "dim")
         if not recent:
             text.insert("end", "  (none yet)\n", "dim")

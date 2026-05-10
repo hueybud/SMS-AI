@@ -360,7 +360,15 @@ def main() -> int:
                 _act_times: list = []
                 _seen_actions: set = set()
                 _drained_at_start = env.drained_states
+                # Per-frame reward accumulator — RewardComputer.step() emits
+                # events to the overlay immediately (real-time) rather than
+                # waiting until rollout end for the batch compute() call.
+                _rc = reward_mod.RewardComputer(
+                    mirror_x, event_sink=reward_event_sink
+                )
+                _rollout_rewards: list = []
                 while not buffer.is_full():
+                    s_t = state                        # capture before step
                     _t0 = time.monotonic()
                     out = agent.act(state)
                     _act_times.append(time.monotonic() - _t0)
@@ -390,6 +398,9 @@ def main() -> int:
                         )
                     state = env.step(state.frame_id, out["btn_flags"], out["stick_vals"])
                     buffer.push_state(state)
+                    _rollout_rewards.append(
+                        _rc.step(s_t, state, bool(state.reset_context))
+                    )
                     total_frames += 1
                 t_collect = time.monotonic() - t_collect_start
                 _act_avg = sum(_act_times) / max(len(_act_times), 1)
@@ -411,9 +422,11 @@ def main() -> int:
                     initial_prev_labels=init_pl,
                 )
 
-                # Reward + GAE for this rollout.  ``last_value`` is taken
-                # from a peek at the carried-forward post-rollout state.
-                traj.rewards = reward_mod.compute(traj, event_sink=reward_event_sink)
+                # Assign rewards collected per-frame during the rollout loop.
+                # flush() drains the poss-progress bucket so the tail shows
+                # up in the overlay even if it didn't cross the emit threshold.
+                _rc.flush()
+                traj.rewards = np.array(_rollout_rewards, dtype=np.float32)
                 last_value = agent.value_only(traj.states[-1])
                 compute_gae(
                     traj,
