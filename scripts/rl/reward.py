@@ -75,12 +75,7 @@ GOAL_REWARD = 1.0
 # recovery.
 LOSS_TO_OPPONENT_DEFENSIVE_THIRD = -0.20   # they recover near our goal — bad
 LOSS_TO_OPPONENT_MIDDLE_THIRD    = -0.10
-LOSS_TO_OPPONENT_ATTACKING_THIRD = -0.03   # we cleared deep, they recovered far — fine
-# The goalie-pickup case overlaps with shot attempts (most shots end in
-# goalie pickup).  With SHOT_REWARD now firing on shot state entry, a
-# successful shot net-rewards the AI; this small term still penalizes
-# weak passes that wander into the goalie's hands without any shot intent.
-LOSS_TO_OPPONENT_GOALIE          = -0.01
+LOSS_TO_OPPONENT_ATTACKING_THIRD = -0.03   # we cleared deep / shot saved — fine
 
 # Dense: possession turnover GAINS — mirror of the loss terms.  Without
 # these, every reward in the function is ≤ 0 and PPO's optimal policy is
@@ -140,6 +135,17 @@ STAGNATION_PENALTY_PER_FRAME = -0.0003
 # expires, so wall-camping never triggers the penalty.  Set to 0.5 units
 # — unmistakable forward progress, invisible to normal dribbling.
 STAGNATION_MIN_ADVANCE = 0.5
+
+# Dense: uncontested backward movement.  Fires per-frame when our striker
+# has the ball, the ball moves backward (-X), and no opponent striker is
+# within BACKWARD_PROXIMITY units (2D, ball-relative Δpos from features).
+# Retreating under pressure is tactical — this only engages when there is
+# no defensive reason to back up.  Magnitude is 2× the forward-progress
+# rate so the AI can't break even by alternating brief backward runs with
+# forward walks.  The gate means it's safe to loosen compared to a blanket
+# backward penalty.
+BACKWARD_UNCONTESTED_PROXIMITY        = 12.0   # units (2D from nearest defender)
+BACKWARD_UNCONTESTED_PENALTY_PER_UNIT = -0.002
 
 # Dense: shot attempt — fires once when one of our strikers enters a
 # shot action state from a non-shot state, AND that specific striker
@@ -254,6 +260,7 @@ _OUR_STRIKER_DX_OFFSETS = (22, 41, 48, 55)
 # detect opponent shot attempts so SHOT_REWARD is symmetric.
 _THEIR_STRIKER_STATE_OFFSETS = (69, 76, 83, 90)
 _THEIR_STRIKER_DX_OFFSETS    = (66, 73, 80, 87)
+_THEIR_STRIKER_DY_OFFSETS    = (67, 74, 81, 88)  # Δpos_y, used for proximity
 
 
 def _anyone_shooting(states_tuple: tuple, xs_tuple: tuple, side_gate) -> bool:
@@ -313,8 +320,9 @@ class RewardComputer:
         rc = RewardComputer(mirror_x, event_sink=reward_event_sink)
         for each frame:
             s_t = state
-            state = env.step(...)
-            rollout_rewards.append(rc.step(s_t, state, state.reset_context))
+            state, drained = env.step(...)
+            chain = [s_t] + drained + [state]
+            rollout_rewards.append(sum(rc.step(chain[i], chain[i+1], ...) ...))
         rc.flush()                          # drain poss-progress bucket
         traj.rewards = np.array(rollout_rewards, dtype=np.float32)
 
@@ -326,12 +334,10 @@ class RewardComputer:
         if mirror_x:
             self._ours       = RIGHT_TEAM_SLOTS
             self._theirs     = LEFT_TEAM_SLOTS
-            self._opp_goalie = LEFT_GOALIE_SLOT
             self._our_goalie = RIGHT_GOALIE_SLOT
         else:
             self._ours       = LEFT_TEAM_SLOTS
             self._theirs     = RIGHT_TEAM_SLOTS
-            self._opp_goalie = RIGHT_GOALIE_SLOT
             self._our_goalie = LEFT_GOALIE_SLOT
 
         self._mirror_x = mirror_x
@@ -401,6 +407,22 @@ class RewardComputer:
                 if self._stagnation_frames > STAGNATION_GRACE_FRAMES:
                     reward += STAGNATION_PENALTY_PER_FRAME
                     self._emit("STAGNATION", STAGNATION_PENALTY_PER_FRAME)
+
+            # Uncontested backward movement — separate from stagnation.
+            # Use squared distance to avoid sqrt; compare against threshold².
+            backward = bpx_t - bpx_t1
+            if backward > 0:
+                f = s_t1.core_features
+                prox_sq = BACKWARD_UNCONTESTED_PROXIMITY ** 2
+                nearest_sq = min(
+                    float(f[dx]) ** 2 + float(f[dy]) ** 2
+                    for dx, dy in zip(_THEIR_STRIKER_DX_OFFSETS,
+                                      _THEIR_STRIKER_DY_OFFSETS)
+                )
+                if nearest_sq > prox_sq:
+                    penalty = BACKWARD_UNCONTESTED_PENALTY_PER_UNIT * backward
+                    reward += penalty
+                    self._emit("BACKWARD_FREE", penalty)
         else:
             self._best_x_streak = None
             self._stagnation_frames = 0
@@ -421,19 +443,22 @@ class RewardComputer:
                 else:
                     self._emit("GAIN_ATK_THIRD", gain)
         elif curr_owner in self._theirs and self._last_owner_team == "ours":
-            if curr_owner == self._opp_goalie:
-                reward += LOSS_TO_OPPONENT_GOALIE
-                self._emit("LOSS_GOALIE", LOSS_TO_OPPONENT_GOALIE)
+            # Pure zone-based loss — no goalie-slot check.  During a save,
+            # Strikers briefly attributes ball ownership to a striker before
+            # the goalie registers, so the slot check was misfiring as
+            # LOSS_ATK_THIRD anyway.  Zone is slot-agnostic: a save always
+            # happens in the attacking third (near their goal), so it
+            # naturally gets LOSS_ATK_THIRD (-0.03), which is already close
+            # to the former LOSS_GOALIE (-0.01) and semantically correct.
+            ball_x = float(s_t1.core_features[0])
+            loss = _zone_penalty_for(ball_x)
+            reward += loss
+            if ball_x < DEF_THIRD_BOUNDARY:
+                self._emit("LOSS_DEF_THIRD", loss)
+            elif ball_x < ATK_THIRD_BOUNDARY:
+                self._emit("LOSS_MID_THIRD", loss)
             else:
-                ball_x = float(s_t1.core_features[0])
-                loss = _zone_penalty_for(ball_x)
-                reward += loss
-                if ball_x < DEF_THIRD_BOUNDARY:
-                    self._emit("LOSS_DEF_THIRD", loss)
-                elif ball_x < ATK_THIRD_BOUNDARY:
-                    self._emit("LOSS_MID_THIRD", loss)
-                else:
-                    self._emit("LOSS_ATK_THIRD", loss)
+                self._emit("LOSS_ATK_THIRD", loss)
 
         if curr_owner in self._ours:
             self._last_owner_team = "ours"

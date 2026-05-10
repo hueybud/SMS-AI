@@ -396,11 +396,20 @@ def main() -> int:
                             f"stick_vals={[round(float(v), 3) for v in out['stick_vals']]}",
                             flush=True,
                         )
-                    state = env.step(state.frame_id, out["btn_flags"], out["stick_vals"])
-                    buffer.push_state(state)
-                    _rollout_rewards.append(
-                        _rc.step(s_t, state, bool(state.reset_context))
+                    state, _drained = env.step(state.frame_id, out["btn_flags"], out["stick_vals"])
+                    # Walk every transition in the chain, including drained
+                    # intermediate frames, so turnovers/shots that happened
+                    # in skipped frames still emit overlay events and
+                    # contribute reward.  Drained rewards fold into this
+                    # action's slot (no corresponding buffer entry for them).
+                    _chain = [s_t] + _drained + [state]
+                    _step_reward = sum(
+                        _rc.step(_chain[i], _chain[i + 1],
+                                 bool(_chain[i + 1].reset_context))
+                        for i in range(len(_chain) - 1)
                     )
+                    buffer.push_state(state)
+                    _rollout_rewards.append(_step_reward)
                     total_frames += 1
                 t_collect = time.monotonic() - t_collect_start
                 _act_avg = sum(_act_times) / max(len(_act_times), 1)

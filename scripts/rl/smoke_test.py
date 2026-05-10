@@ -168,7 +168,7 @@ def main() -> int:
             # AI's character move (or not) on screen.
             stick = stick_up if (i // 60) % 2 == 0 else stick_neutral
             try:
-                state = env.step(last_frame_id, btn_neutral, stick)
+                state, _ = env.step(last_frame_id, btn_neutral, stick)
             except (ConnectionError, OSError) as e:
                 print(f"[smoke] FAIL: socket died at i={i}: {e}", file=sys.stderr)
                 return 1

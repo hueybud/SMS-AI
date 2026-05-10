@@ -133,7 +133,7 @@ def main() -> int:
         try:
             while True:
                 btn, stick = agent.act(state)
-                state = env.step(state.frame_id, btn, stick)
+                state, _ = env.step(state.frame_id, btn, stick)
                 n_frames += 1
                 if state.reset_context:
                     n_resets += 1

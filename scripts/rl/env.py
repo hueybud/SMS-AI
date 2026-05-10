@@ -69,7 +69,7 @@ class Env:
         btn_probs: np.ndarray,
         stick_vals: np.ndarray,
         drain: bool = True,
-    ) -> StateFrame:
+    ) -> tuple[StateFrame, list[StateFrame]]:
         """Send action + block for next state. Convenience for synchronous play.
 
         With ``drain=True`` (default), after reading the next STATE we
@@ -97,6 +97,7 @@ class Env:
             raise RuntimeError("Env is closed")
         self.send_action(frame_id, btn_probs, stick_vals)
         state = self.recv_state()
+        drained: list[StateFrame] = []
         if drain:
             while True:
                 ready, _, _ = select.select([self._sock], [], [], 0)
@@ -107,9 +108,10 @@ class Env:
                     raise RuntimeError(
                         f"unexpected tag during drain: 0x{tag:02x}"
                     )
+                drained.append(state)   # previous state is now an intermediate
                 state = protocol.unpack_state(body)
                 self.drained_states += 1
-        return state
+        return state, drained
 
     def pause(self) -> None:
         """Ask Dolphin to pause the live emulator until ``resume()``.
