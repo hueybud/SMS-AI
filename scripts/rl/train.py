@@ -17,6 +17,7 @@ Run::
     py -3.9 -m rl.train                        # all defaults, single env
     py -3.9 -m rl.train --device cuda          # GPU forward pass
     py -3.9 -m rl.train --rollout-length 480   # 8s rollouts instead of 4s
+    py -3.9 -m rl.train --reward-overlay       # auto-spawn reward overlay window
 
 The match running on screen will be your-controlled-port (the AI agent)
 vs whatever CPU you set up.  Press Ctrl+C to save final weights and exit.
@@ -27,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -170,6 +172,13 @@ def main() -> int:
                         "(updates take ~6s); unnecessary on GPU (updates "
                         "are sub-second).  Routed via Core::QueueHostJob "
                         "on the C++ side — see AIController.cpp.")
+    p.add_argument("--reward-overlay", action="store_true",
+                   help="Spawn the reward overlay window automatically in a "
+                        "new console.  Picks a free port and wires everything "
+                        "up — no need to run reward_overlay.py manually.")
+    p.add_argument("--reward-overlay-port", type=int, default=0,
+                   help="Broadcast reward events to 127.0.0.1:<port> (manual "
+                        "mode; ignored when --reward-overlay is set).")
     args = p.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -193,6 +202,45 @@ def main() -> int:
     norm_mean = torch.from_numpy(stats["mean"].astype(np.float32))
     norm_std = torch.from_numpy(stats["std"].astype(np.float32))
     print(f"[train] norm stats loaded from {args.norm_stats}")
+
+    # ── Optional reward-overlay UDP emitter ──────────────────────────────
+    # UDP fire-and-forget — never blocks, dropped packets are fine since
+    # the overlay only displays a recent window anyway.
+    _overlay_proc: Optional[subprocess.Popen] = None
+    if args.reward_overlay:
+        # Grab a free UDP port by binding then releasing it.
+        _tmp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _tmp.bind(("127.0.0.1", 0))
+        args.reward_overlay_port = _tmp.getsockname()[1]
+        _tmp.close()
+        _overlay_proc = subprocess.Popen(
+            [sys.executable, "-m", "rl.reward_overlay",
+             "--port", str(args.reward_overlay_port)],
+            cwd=str(_SCRIPTS_DIR),
+            creationflags=(subprocess.CREATE_NEW_CONSOLE
+                           if sys.platform == "win32" else 0),
+        )
+        print(
+            f"[train] reward overlay spawned on port {args.reward_overlay_port} "
+            f"(pid={_overlay_proc.pid})"
+        )
+
+    reward_event_sink = None
+    if args.reward_overlay_port:
+        import json
+        _overlay_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        _overlay_addr = ("127.0.0.1", args.reward_overlay_port)
+
+        def reward_event_sink(name: str, value: float) -> None:
+            try:
+                _overlay_sock.sendto(
+                    json.dumps({"comp": name, "val": value}).encode("utf-8"),
+                    _overlay_addr,
+                )
+            except OSError:
+                pass
+
+        print(f"[train] reward overlay → udp://127.0.0.1:{args.reward_overlay_port}")
 
     config = PPOConfig(
         epsilon=args.ppo_epsilon,
@@ -362,7 +410,7 @@ def main() -> int:
 
                 # Reward + GAE for this rollout.  ``last_value`` is taken
                 # from a peek at the carried-forward post-rollout state.
-                traj.rewards = reward_mod.compute(traj)
+                traj.rewards = reward_mod.compute(traj, event_sink=reward_event_sink)
                 last_value = agent.value_only(traj.states[-1])
                 compute_gae(
                     traj,
@@ -485,6 +533,9 @@ def main() -> int:
             )
             log_f.close()
             csv_f.close()
+            if _overlay_proc is not None:
+                _overlay_proc.terminate()
+                print("[train] reward overlay terminated")
 
     return 0
 
