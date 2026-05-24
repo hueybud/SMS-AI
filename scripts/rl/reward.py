@@ -1,21 +1,22 @@
 """Reward function for PPO over Trajectory rollouts.
 
-Four reward sources combine into a single per-frame reward for the
+Five reward sources combine into a single per-frame reward for the
 agent's perspective:
 
     - **Sparse — goal differential**.  ``±GOAL_REWARD`` per goal scored
       across the transition.  Zero-sum: agent's team scores → +X; their
       team scores → -X.
-    - **Dense — possession turnover, zoned, symmetric**.  Zone is decided
+    - **Dense — possession turnover, zoned, zero-sum**.  Zone is decided
       by ball x at the moment of recovery (where the new owner picked it
       up).  Losses (we → them) are penalized; gains (them → us) are
-      rewarded.  Magnitudes are intentionally asymmetric (losses larger
-      than gains) so the policy stays cautious, but both signs exist so
-      PPO has a positive direction to climb.  Goalie pickups get a flat
-      small term either way.  Detection tracks the LAST team to own the
-      ball, not just the previous frame's owner — clears (us → loose →
-      them) and hit-recoveries (them → loose → us) both fire correctly
-      even though the ball passes through a loose-ball intermediary.
+      rewarded.  Magnitudes are the zero-sum mirror of each other across
+      POVs: our loss in zone Z = the opponent's gain in their mirrored
+      zone (def↔atk, mid↔mid), so the function applied to both POVs
+      nets exactly to zero per event.  Goalie pickups get a flat small
+      term either way.  Detection tracks the LAST team to own the ball,
+      not just the previous frame's owner — clears (us → loose → them)
+      and hit-recoveries (them → loose → us) both fire correctly even
+      though the ball passes through a loose-ball intermediary.
     - **Dense — possession progress**.  Per-frame bonus proportional to
       forward ball motion (+X = toward opponent goal) while one of our
       strikers has the ball.  Goalie possession is excluded — the
@@ -27,6 +28,11 @@ agent's perspective:
       0x11, 0x12}).  Counter-balances the goalie-pickup penalty so the
       AI learns to shoot, not to avoid shooting.  Detection is purely
       state-driven, not velocity-heuristic.
+    - **Dense — wall-camp**.  Fires when the policy is sending main-stick
+      input (magnitude ≥ 0.3) but the selected player isn't actually
+      moving — i.e. pushed into a wall or corner.  Independent of ball
+      ownership.  60-frame grace, one-shot back-pay on threshold
+      crossing plus per-frame thereafter.
 
 Reset boundaries are handled carefully: the **goal** signal is preserved
 across a reset boundary (the gap between our last in-play frame and the
@@ -79,12 +85,20 @@ LOSS_TO_OPPONENT_ATTACKING_THIRD = -0.03   # we cleared deep / shot saved — fi
 
 # Dense: possession turnover GAINS — mirror of the loss terms.  Without
 # these, every reward in the function is ≤ 0 and PPO's optimal policy is
-# "minimize event count" → don't engage, don't shoot, sit still.  Magnitudes
-# are smaller than the matching losses so the policy stays defensively
-# biased, but the positive signal lets it actually learn what to do.
+# "minimize event count" → don't engage, don't shoot, sit still.
+#
+# Magnitudes are the zero-sum mirror of the matching losses: our gain in
+# zone Z equals the opponent's loss in their mirrored zone, so the same
+# function applied to both POVs nets to zero across every turnover event.
+# (Pair: our LOSS_DEF ↔ their GAIN_ATK, our LOSS_MID ↔ their GAIN_MID,
+# our LOSS_ATK ↔ their GAIN_DEF.)  Earlier values were deliberately
+# smaller than the losses to bias the policy defensively, but that left
+# the shaping non-zero-sum without strong justification — and made the
+# opponent perceive the same event with a different magnitude, which
+# matters once self-play is on the table.
 GAIN_FROM_OPPONENT_DEFENSIVE_THIRD = +0.03   # we recovered deep in our half — relief
-GAIN_FROM_OPPONENT_MIDDLE_THIRD    = +0.07
-GAIN_FROM_OPPONENT_ATTACKING_THIRD = +0.15   # we tackled them in their box — great
+GAIN_FROM_OPPONENT_MIDDLE_THIRD    = +0.10
+GAIN_FROM_OPPONENT_ATTACKING_THIRD = +0.20   # we tackled them in their box — great
 GAIN_FROM_OPPONENT_GOALIE          = +0.01   # opponent goalie released, we picked up
 
 # Dense: possession progress.  Rewards forward ball motion (+X = toward
@@ -147,6 +161,30 @@ STAGNATION_MIN_ADVANCE = 0.5
 BACKWARD_UNCONTESTED_PROXIMITY        = 5.0    # units (2D from nearest defender)
 BACKWARD_UNCONTESTED_PENALTY_PER_UNIT = -0.002
 
+# Dense: wall-camp penalty.  Independent of ball ownership — fires when
+# our user-controlled (selected) striker is "trying to move" but actually
+# isn't.  "Trying" = main-stick magnitude ≥ WALL_CAMP_INTENT_THRESHOLD.
+# "Isn't moving" = world displacement from an anchor stays below
+# STAGNATION_MIN_ADVANCE (0.5 units) over a 60-frame window.  Self-block
+# is ball-relative in features (offsets 22..40), so we reconstruct world
+# pos as ball_xy + Δself_xy.
+#
+# Penalty shape: 60-frame grace, then a one-shot back-pay on the crossing
+# frame followed by per-frame thereafter.  The back-pay exists because a
+# pure post-grace per-frame penalty gives the policy 60 free frames of
+# wall-camping below threshold (59 frames pays 0, 60 frames pays one
+# small amount); the back-pay makes the threshold crossing meaningful.
+# Magnitudes anchored so 3 seconds of wall-camping ≈ -0.30 = third of
+# the goal terminal.
+WALL_CAMP_GRACE_FRAMES        = 60
+WALL_CAMP_BACKPAY             = -0.06    # one-shot at crossing (≈ 2× LOSS_ATK)
+WALL_CAMP_PENALTY_PER_FRAME   = -0.002
+WALL_CAMP_INTENT_THRESHOLD    = 0.3      # main-stick magnitude floor for "trying"
+# Feature offsets for the selected player's ball-relative Δpos (see
+# AIController::ReadGameStateCore section 3 — "Self character (19)").
+_SELF_DX_OFFSET = 22  # Δpos_x to ball
+_SELF_DY_OFFSET = 23  # Δpos_y to ball
+
 # Dense: shot attempt — fires once when one of our strikers enters a
 # shot action state from a non-shot state, AND that specific striker
 # is on the offensive side of the field (their mirrored x > 0).
@@ -162,6 +200,17 @@ BACKWARD_UNCONTESTED_PENALTY_PER_UNIT = -0.002
 # We gate on the striker's position, not the ball's: nearly always the
 # same thing since the carrier holds the ball, but the striker's
 # location is what semantically distinguishes a shot from a clear.
+# Intentionally exceeds |LOSS_ATK_THIRD| (0.03) so that "shoot and miss,
+# opponent rebounds at their goal" — the most common outcome of any shot
+# attempt — nets +0.02 rather than zero.  The pro-shot bias is deliberate
+# bootstrapping for exploration: at ~25% conversion in competitive play,
+# the +1.0 goal terminal only starts pulling weight in the gradient once
+# the policy has *taken* enough shots to sample it.  A neutral-on-miss
+# value (0.03) was tried and observed to suppress shooting entirely on
+# short ThinkPad runs — the policy never got far enough to discover the
+# goal signal.  Shots that lead to deeper counters (mid-third recovery,
+# -0.10) still net solidly negative, so this isn't a free pellet — it's a
+# nudge toward "try the shot" when the rebound is shallow.
 SHOT_REWARD = +0.05
 # Mirror penalty for the opponent entering a shot state on their
 # offensive side (the agent's defensive side, mirrored x < 0).  Without
@@ -348,13 +397,28 @@ class RewardComputer:
         self._best_x_streak: Optional[float] = None
         self._stagnation_frames: int = 0
         self._poss_progress_bucket: float = 0.0
+        # Wall-camp tracking — independent of ball ownership.  Anchor is the
+        # selected player's world (x, y) at the moment intent-to-move first
+        # registered without subsequent displacement; cleared when intent
+        # drops, when the player moves ≥ STAGNATION_MIN_ADVANCE from the
+        # anchor, or on reset / non-active phase.
+        self._self_anchor_xy: Optional[tuple] = None
+        self._wall_camp_frames: int = 0
 
     def _emit(self, name: str, value: float) -> None:
         if self._sink is not None and value != 0.0:
             self._sink(name, float(value))
 
-    def step(self, s_t: StateFrame, s_t1: StateFrame, is_resetting: bool) -> float:
-        """Compute reward for one transition (s_t → s_t1). Returns scalar."""
+    def step(self, s_t: StateFrame, s_t1: StateFrame, is_resetting: bool,
+             intended_stick: Optional[np.ndarray] = None) -> float:
+        """Compute reward for one transition (s_t → s_t1). Returns scalar.
+
+        ``intended_stick`` is the 4-vector the policy sent for this
+        transition (stick_x, stick_y, cstick_x, cstick_y) — only the main
+        stick magnitude is consulted, for the wall-camp signal.  None
+        disables wall-camp detection (used by batch ``compute()`` callers
+        that don't have a per-transition stick on hand).
+        """
         reward = 0.0
 
         # Seed last_owner_team from the first s_t we see.
@@ -384,7 +448,73 @@ class RewardComputer:
             self._last_owner_team = None
             self._best_x_streak = None
             self._stagnation_frames = 0
+            self._self_anchor_xy = None
+            self._wall_camp_frames = 0
             return reward
+
+        # ── Active-play gate ────────────────────────────────────────────────
+        # game_phase: 0=pre, 1=kickoff, 2=goal, 3=transition, 4/5=active play.
+        # Stagnation, possession-progress, AND wall-camp only make sense
+        # during phases 4/5.  Kickoff hold (phase 1) forces our striker
+        # still with the ball, and the engine ignores stick input during
+        # the hold — both of these would produce false-positive penalties.
+        # Reset the counters here too so a long kickoff doesn't immediately
+        # register as 120+ stagnation frames the instant active play
+        # resumes.
+        if int(s_t1.game_phase) not in (4, 5):
+            self._best_x_streak = None
+            self._stagnation_frames = 0
+            self._self_anchor_xy = None
+            self._wall_camp_frames = 0
+            return reward
+
+        # ── Wall-camp (selected player, ball-ownership-independent) ─────────
+        # Fires when the policy is sending non-trivial main-stick input but
+        # the selected player isn't actually moving — i.e. pushed into a
+        # wall or corner.  Detection is grace-then-linear with a one-shot
+        # back-pay on the crossing frame so 60 frames of wall-camp aren't
+        # all "free."  Self-block features are ball-relative, so we
+        # reconstruct world XY from ball XY + Δself.
+        if intended_stick is not None:
+            sx = float(intended_stick[0])
+            sy = float(intended_stick[1])
+            stick_mag = (sx * sx + sy * sy) ** 0.5
+            if stick_mag < WALL_CAMP_INTENT_THRESHOLD:
+                # No real intent to move — wall-camp doesn't apply.  Clear
+                # state so we don't trigger on the next non-neutral frame
+                # against a stale anchor.
+                self._self_anchor_xy = None
+                self._wall_camp_frames = 0
+            else:
+                # World position of selected player this frame.
+                ball_x = float(s_t1.core_features[0])
+                ball_y = float(s_t1.core_features[1])
+                self_x = ball_x + float(s_t1.core_features[_SELF_DX_OFFSET])
+                self_y = ball_y + float(s_t1.core_features[_SELF_DY_OFFSET])
+                if self._self_anchor_xy is None:
+                    self._self_anchor_xy = (self_x, self_y)
+                    self._wall_camp_frames = 0
+                else:
+                    ax, ay = self._self_anchor_xy
+                    ddx = self_x - ax
+                    ddy = self_y - ay
+                    dist = (ddx * ddx + ddy * ddy) ** 0.5
+                    if dist >= STAGNATION_MIN_ADVANCE:
+                        # Moved enough — re-anchor here and start over.
+                        self._self_anchor_xy = (self_x, self_y)
+                        self._wall_camp_frames = 0
+                    else:
+                        self._wall_camp_frames += 1
+                        # Threshold crossing fires the back-pay exactly
+                        # once.  Use == so a counter rolled past grace
+                        # without paying (shouldn't happen, but defensive)
+                        # doesn't double-charge.
+                        if self._wall_camp_frames == WALL_CAMP_GRACE_FRAMES + 1:
+                            reward += WALL_CAMP_BACKPAY
+                            self._emit("WALL_CAMP_BACKPAY", WALL_CAMP_BACKPAY)
+                        elif self._wall_camp_frames > WALL_CAMP_GRACE_FRAMES + 1:
+                            reward += WALL_CAMP_PENALTY_PER_FRAME
+                            self._emit("WALL_CAMP", WALL_CAMP_PENALTY_PER_FRAME)
 
         curr_owner = _owner_slot(s_t1)
 
@@ -503,7 +633,9 @@ def compute(traj: Trajectory, event_sink: EventSink = None) -> np.ndarray:
     rewards = np.zeros(traj.length, dtype=np.float32)
     for t in range(traj.length):
         rewards[t] = rc.step(
-            traj.states[t], traj.states[t + 1], bool(traj.is_resetting[t + 1])
+            traj.states[t], traj.states[t + 1],
+            bool(traj.is_resetting[t + 1]),
+            intended_stick=traj.stick_vals[t],
         )
     rc.flush()
     return rewards

@@ -43,6 +43,7 @@ def make_traj(T: int = 240) -> Trajectory:
             frame_id=t,
             reset_context=False,
             mirror_x=False,
+            game_phase=4,  # treat synthetic frames as active play
             score_left=0,
             score_right=0,
             core_features=np.random.randn(CORE_FEATURE_DIM).astype(np.float32),

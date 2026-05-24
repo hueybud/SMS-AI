@@ -27,6 +27,9 @@ State packet body (after tag)::
     u32  frame_id
     u8   reset_context        (1 = first frame after a phase / episode reset)
     u8   mirror_x             (1 = AI's team attacks left)
+    u8   game_phase           (raw eGameState byte: 0=pre, 1=kickoff, 2=goal,
+                                3=transition, 4/5=active play.  Reward
+                                shaping should gate on phase ∈ {4,5}.)
     u16  score_left
     u16  score_right
     f32  core_features[183]
@@ -68,8 +71,9 @@ TAG_SHUTDOWN = 0x11
 TAG_PAUSE = 0x12
 TAG_RESUME = 0x13
 
-# State header format (after the 1-byte tag).  IBBHH = u32, u8, u8, u16, u16.
-_STATE_HEADER_FMT = "<IBBHH"
+# State header format (after the 1-byte tag).  IBBBHH = u32 frame_id,
+# u8 reset_context, u8 mirror_x, u8 game_phase, u16 score_left, u16 score_right.
+_STATE_HEADER_FMT = "<IBBBHH"
 _STATE_HEADER_SIZE = struct.calcsize(_STATE_HEADER_FMT)
 _STATE_FEAT_BYTES = CORE_FEATURE_DIM * 4
 _STATE_BODY_SIZE = _STATE_HEADER_SIZE + _STATE_FEAT_BYTES
@@ -86,6 +90,7 @@ class StateFrame:
     frame_id: int
     reset_context: bool
     mirror_x: bool
+    game_phase: int  # raw eGameState; reward shaping should gate on {4,5}
     score_left: int
     score_right: int
     core_features: np.ndarray  # shape (183,), dtype=float32
@@ -137,7 +142,7 @@ def unpack_state(body: bytes) -> StateFrame:
             f"STATE body wrong size: got {len(body)}, expected {_STATE_BODY_SIZE} "
             f"(header {_STATE_HEADER_SIZE} + features {_STATE_FEAT_BYTES})"
         )
-    frame_id, reset_b, mirror_b, score_l, score_r = struct.unpack_from(
+    frame_id, reset_b, mirror_b, game_phase, score_l, score_r = struct.unpack_from(
         _STATE_HEADER_FMT, body, 0
     )
     feats = np.frombuffer(
@@ -147,6 +152,7 @@ def unpack_state(body: bytes) -> StateFrame:
         frame_id=frame_id,
         reset_context=bool(reset_b),
         mirror_x=bool(mirror_b),
+        game_phase=int(game_phase),
         score_left=score_l,
         score_right=score_r,
         core_features=feats,

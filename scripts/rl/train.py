@@ -168,13 +168,37 @@ def main() -> int:
                         "rollout through one SDPA per layer (default, "
                         "slippi-ai-style); 'loop' is the original 240-frame "
                         "Python loop kept for fallback / debugging")
-    p.add_argument("--pause-on-update", action="store_true",
+    p.add_argument("--pause-on-update", action=argparse.BooleanOptionalAction,
+                   default=True,
                    help="Freeze the live game across PPO updates so "
                         "opponents can't score against a held-action AI "
-                        "during the wall-clock gap.  Recommended on CPU "
-                        "(updates take ~6s); unnecessary on GPU (updates "
-                        "are sub-second).  Routed via Core::QueueHostJob "
-                        "on the C++ side — see AIController.cpp.")
+                        "during the wall-clock gap, AND so the C++ side "
+                        "doesn't pile up STATE packets while Python is "
+                        "doing the update (which floods the reward overlay "
+                        "with stagnation events on the next rollout).  "
+                        "Default ON — appropriate for CPU (updates ~6s); "
+                        "pass --no-pause-on-update on GPU where updates "
+                        "are sub-second and the freeze is wasteful.  "
+                        "Routed via Core::QueueHostJob on the C++ side — "
+                        "see AIController.cpp.")
+    p.add_argument("--reset-agent-on-update",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="After each PPO update, zero the live agent's KV "
+                        "cache and prev_labels.  Why: the cache/labels held "
+                        "by the live agent were produced by the PRE-update "
+                        "weights; reading them with POST-update weights is "
+                        "off-distribution and has been observed to make the "
+                        "character run backwards on resume (esp. with "
+                        "--pause-on-update, which makes the mismatch land "
+                        "on the exact same state that closed the prior "
+                        "rollout).  Default ON.  Diagnostic flag — pass "
+                        "--no-reset-agent-on-update to A/B test the effect.")
+    p.add_argument("--debug-post-update-frames", type=int, default=20,
+                   help="After each PPO update, log the next N actions in "
+                        "detail (stick_x/stick_y/action_idx) so we can see "
+                        "whether the policy is producing backward-stick "
+                        "actions immediately post-update.  Set to 0 to "
+                        "disable.")
     p.add_argument("--reward-overlay", action="store_true",
                    help="Spawn the reward overlay window automatically in a "
                         "new console.  Picks a free port and wires everything "
@@ -345,6 +369,27 @@ def main() -> int:
         NULL_METRICS["rho/mean"] = 1.0
         NULL_METRICS["epoch"] = -1
 
+        # Per-frame reward accumulator — RewardComputer.step() emits events
+        # to the overlay immediately (real-time) rather than waiting until
+        # rollout end for the batch compute() call.  Lives OUTSIDE the
+        # rollout loop so cross-frame counters (stagnation frames, best-x
+        # streak, last owner) survive rollout boundaries.  Without this,
+        # stagnation that spans a boundary resets its counter to 0 each
+        # rollout and never crosses the grace threshold — PPO then can't
+        # learn the link between "held the ball still" and the penalty.
+        # The legitimate reset (kickoff/goal) is handled by is_resetting
+        # inside step() itself.
+        _rc = reward_mod.RewardComputer(mirror_x, event_sink=reward_event_sink)
+
+        # Diagnostic counter for post-update action logging.  Set to
+        # args.debug_post_update_frames after each UPD; decremented on
+        # each act().  Initialized to 0 so first-rollout actions don't log.
+        _post_update_remaining = 0
+        # Rolling stick_x stats per rollout — lets us spot a sudden shift
+        # toward backward stick after an update.  Reset at the top of each
+        # rollout.
+        _stick_x_samples: list = []
+
         try:
             while args.max_rollouts < 0 or rollout_idx < args.max_rollouts:
                 # Snapshot agent state for THIS rollout's PPO replay.
@@ -360,13 +405,8 @@ def main() -> int:
                 _act_times: list = []
                 _seen_actions: set = set()
                 _drained_at_start = env.drained_states
-                # Per-frame reward accumulator — RewardComputer.step() emits
-                # events to the overlay immediately (real-time) rather than
-                # waiting until rollout end for the batch compute() call.
-                _rc = reward_mod.RewardComputer(
-                    mirror_x, event_sink=reward_event_sink
-                )
                 _rollout_rewards: list = []
+                _stick_x_samples = []  # fresh per rollout
                 while not buffer.is_full():
                     s_t = state                        # capture before step
                     _t0 = time.monotonic()
@@ -385,6 +425,26 @@ def main() -> int:
                         (int(out["action_idx"]),
                          tuple(int(b) for b in out["stick_bin_idx"]))
                     )
+                    # Track main-stick X for per-rollout summary stats (used
+                    # to spot a sudden backward shift right after an update).
+                    _stick_x_samples.append(float(out["stick_vals"][0]))
+                    # Post-update detailed action log: dump the first
+                    # debug_post_update_frames actions after each UPD so we
+                    # can eyeball whether the policy starts producing
+                    # negative-stick (backward) actions immediately on
+                    # resume, with or without the KV reset.
+                    if _post_update_remaining > 0:
+                        sv = out["stick_vals"]
+                        print(
+                            f"[diag-post-upd] +{args.debug_post_update_frames - _post_update_remaining:>2d} "
+                            f"frame_id={state.frame_id} "
+                            f"action_idx={int(out['action_idx'])} "
+                            f"stick=({float(sv[0]):+.2f},{float(sv[1]):+.2f},"
+                            f"{float(sv[2]):+.2f},{float(sv[3]):+.2f}) "
+                            f"btn={out['btn_flags'].astype(int).tolist()}",
+                            flush=True,
+                        )
+                        _post_update_remaining -= 1
                     # Log every 60th action to show what Python is actually
                     # sending and the frame_id we echoed back to C++.
                     if (total_frames % 60) == 0:
@@ -403,9 +463,15 @@ def main() -> int:
                     # contribute reward.  Drained rewards fold into this
                     # action's slot (no corresponding buffer entry for them).
                     _chain = [s_t] + _drained + [state]
+                    # All drained frames inherit this iteration's action
+                    # (C++ re-applies the cached pad until a new ACTION
+                    # arrives), so pass the same intended_stick to every
+                    # step() call in the chain — wall-camp evaluates against
+                    # what the policy *meant* to do at this iteration.
                     _step_reward = sum(
                         _rc.step(_chain[i], _chain[i + 1],
-                                 bool(_chain[i + 1].reset_context))
+                                 bool(_chain[i + 1].reset_context),
+                                 intended_stick=out["stick_vals"])
                         for i in range(len(_chain) - 1)
                     )
                     buffer.push_state(state)
@@ -415,13 +481,25 @@ def main() -> int:
                 _act_avg = sum(_act_times) / max(len(_act_times), 1)
                 _act_max = max(_act_times) if _act_times else 0.0
                 _drained_this_rollout = env.drained_states - _drained_at_start
+                # Per-rollout stick_x stats — mean and fraction-backward.
+                # If post-update rollouts skew negative compared to neutral
+                # baseline rollouts, that's evidence the policy is biasing
+                # backward (with or without the KV reset, we can tell which).
+                if _stick_x_samples:
+                    _sx_mean = sum(_stick_x_samples) / len(_stick_x_samples)
+                    _sx_back = sum(1 for v in _stick_x_samples if v < -0.1) / len(_stick_x_samples)
+                else:
+                    _sx_mean = 0.0
+                    _sx_back = 0.0
                 print(
                     f"[diag] rollout {rollout_idx} "
                     f"act_avg={_act_avg * 1000:.1f}ms "
                     f"act_max={_act_max * 1000:.1f}ms "
                     f"unique_actions={len(_seen_actions)}/{len(_act_times)} "
                     f"drained_states={_drained_this_rollout} "
-                    f"(>16.7ms means we lag 60fps; drained=skipped game frames)",
+                    f"stick_x_mean={_sx_mean:+.2f} frac_back={_sx_back:.2f} "
+                    f"(>16.7ms means we lag 60fps; drained=skipped game frames; "
+                    f"frac_back = fraction of actions with stick_x<-0.1)",
                     flush=True,
                 )
 
@@ -472,12 +550,35 @@ def main() -> int:
                         # auto-resume on connection drop as a backstop).
                         if args.pause_on_update:
                             env.pause()
+                        # Snapshot KV norm before reset so we can confirm
+                        # the reset actually happened (zero after).
+                        _kv_norm_pre = float(agent.kv_cache.norm().item())
                         try:
                             metrics = learner.update(batch_trajs)
                         finally:
                             if args.pause_on_update:
                                 env.resume()
                         update_tag = "UPD"
+                        # KV / prev_labels reset — see --reset-agent-on-update.
+                        # Diagnostic: log magnitude before/after so we can
+                        # tell at a glance whether the reset fired.
+                        if args.reset_agent_on_update:
+                            agent.reset()
+                            _kv_norm_post = float(agent.kv_cache.norm().item())
+                            print(
+                                f"[diag] post-update agent reset: "
+                                f"kv_norm {_kv_norm_pre:.3f} -> {_kv_norm_post:.3f}, "
+                                f"prev_labels zeroed",
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                f"[diag] post-update NO agent reset: "
+                                f"kv_norm={_kv_norm_pre:.3f} carried into next rollout",
+                                flush=True,
+                            )
+                        # Arm post-update action logging.
+                        _post_update_remaining = args.debug_post_update_frames
                     else:
                         update_tag = "skp"
                     t_update = time.monotonic() - t_update_start
