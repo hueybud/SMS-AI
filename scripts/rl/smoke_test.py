@@ -31,7 +31,7 @@ import time
 
 import numpy as np
 
-from .dolphin import DEFAULT_DOLPHIN_EXE, Dolphin
+from .dolphin import DEFAULT_DOLPHIN_EXE, DEFAULT_NOGUI_EXE, Dolphin
 from .env import Env
 
 DEFAULT_ISO = (
@@ -41,8 +41,11 @@ DEFAULT_ISO = (
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--iso", default=DEFAULT_ISO)
-    p.add_argument("--exe", default=DEFAULT_DOLPHIN_EXE)
+    p.add_argument("--iso", default=DEFAULT_ISO,
+                   help="path to Strikers ISO")
+    p.add_argument("--exe", default=None,
+                   help="dolphin executable (default: windowed Citrus Dolphin.exe, "
+                        "or dolphin-emu-nogui under --headless)")
     p.add_argument("--frames", type=int, default=600, help="frames to exchange before stopping")
     p.add_argument("--port", type=int, default=None, help="fixed IPC port (default: pick free)")
     p.add_argument(
@@ -56,7 +59,32 @@ def main() -> int:
         action="store_true",
         help="don't kill Dolphin when the smoke test finishes (so you can read the log window)",
     )
+    p.add_argument(
+        "--headless",
+        action="store_true",
+        help="launch dolphin-emu-nogui in headless mode (Linux/ThunderCompute). "
+             "Requires --savestate-path so we boot straight into a kickoff.",
+    )
+    p.add_argument(
+        "--savestate-path",
+        default=None,
+        help="path to a .sav file to boot into (required under --headless). "
+             "Resolved by Dolphin relative to the working dir or absolute.",
+    )
+    p.add_argument(
+        "--worker-id",
+        type=int,
+        default=0,
+        help="worker number (drives port + tmpdir under --headless)",
+    )
     args = p.parse_args()
+
+    if args.headless and not args.savestate_path:
+        p.error("--headless requires --savestate-path (no human to navigate menus)")
+
+    # Default exe resolves based on mode.
+    if args.exe is None:
+        args.exe = DEFAULT_NOGUI_EXE if args.headless else DEFAULT_DOLPHIN_EXE
 
     print(f"[smoke] iso={args.iso}")
     print(f"[smoke] exe={args.exe}")
@@ -74,6 +102,9 @@ def main() -> int:
         ipc_port=args.port,
         dolphin_exe=args.exe,
         keep_alive=args.keep_alive,
+        headless=args.headless,
+        worker_id=args.worker_id,
+        savestate_path=args.savestate_path,
     ) as dolphin:
         env = Env(dolphin.socket)
 
