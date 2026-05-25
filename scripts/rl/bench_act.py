@@ -45,12 +45,9 @@ import time
 import numpy as np
 import torch
 
-from export_onnx_transformer import (  # noqa: E402
-    CORE_FEATURE_DIM,
-    _flat_to_entities_onnx,
-)
+from export_onnx_transformer import _flat_to_entities_onnx  # noqa: E402
 
-from .protocol import StateFrame
+from .protocol import CORE_FEATURE_DIM, StateFrame
 from .rl_agent import BatchedRLAgent
 from .train import DEFAULT_CHECKPOINT, DEFAULT_NORM_STATS, _load_bc
 
