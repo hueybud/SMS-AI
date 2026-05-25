@@ -9,5 +9,8 @@ matplotlib>=3.7
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
 torch>=2.0
 
+# Needed for the RL gym (rl/dolphin.py) — per-worker TCP port allocation.
+portpicker>=1.5
+
 # Optional: only needed for export_onnx.py and verify_chip_shots.py
 onnxruntime>=1.17
