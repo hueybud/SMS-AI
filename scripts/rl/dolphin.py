@@ -252,12 +252,19 @@ class Dolphin:
 
         cp["Core"] = {
             "GFXBackend": "Null",
-            "EmulationSpeed": "0",  # 0 = unlimited
+            "EmulationSpeed": "0",  # 0 = unlimited (also forced by BootManager
+                                    # when AIIpcPort > 0)
             # CPU thread on, JIT64, DSP HLE — defaults that work on Linux x86_64.
             "CPUThread": "True",
             "CPUCore": "1",  # Cached Interpreter on ARM, JIT64 on x86
             "DSPHLE": "True",
             "FastDiscSpeed": "True",
+            # Disable Citrus CIT replay auto-recording.  Default is True (the
+            # windowed flow captures every match for replay).  In RL we don't
+            # want match-end to write a .citframes file (disk balloon) or
+            # require base.sav to exist on the worker.  Core.cpp:390 gates
+            # auto-recording on this flag.
+            "Replays": "False",
         }
         cp["DSP"] = {
             "Backend": "No Audio Output",
