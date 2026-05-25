@@ -53,9 +53,14 @@ DEFAULT_DOLPHIN_INI = Path(
     r"C:\Users\Brian\Documents\Dolphin Emulator\Config\Dolphin.ini"
 )
 
-# Headless Linux defaults — convention from `linux_compat.md`.  Override
-# explicitly when the build lives elsewhere on ThunderCompute.
-DEFAULT_NOGUI_EXE = "/root/Project-Citrus2/build/Binaries/dolphin-emu-nogui"
+# Headless Linux defaults — resolved against $HOME so the same script works
+# under either the `ubuntu` or `root` ThunderCompute login.  The repo is
+# usually cloned to ~/Project-Citrus (no "2" suffix — that's the local
+# Windows checkout's name, the remote is hueybud/Project-Citrus).  Override
+# via --exe / dolphin_exe= when the build lives elsewhere.
+DEFAULT_NOGUI_EXE = os.path.expanduser(
+    "~/Project-Citrus/build/Binaries/dolphin-emu-nogui"
+)
 
 # Base port for deterministic multi-env allocation.  worker_id N gets
 # port BASE + N.  Pinning to a range (vs portpicker's roaming) prevents
