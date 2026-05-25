@@ -30,6 +30,9 @@ State packet body (after tag)::
     u8   game_phase           (raw eGameState byte: 0=pre, 1=kickoff, 2=goal,
                                 3=transition, 4/5=active play.  Reward
                                 shaping should gate on phase ∈ {4,5}.)
+    u8   match_end            (raw byte from Metadata::addressMatchEnd —
+                                same flag the CITF flow uses.  Latch the
+                                0→1 transition to fire a savestate RESET.)
     u16  score_left
     u16  score_right
     f32  core_features[183]
@@ -71,9 +74,10 @@ TAG_SHUTDOWN = 0x11
 TAG_PAUSE = 0x12
 TAG_RESUME = 0x13
 
-# State header format (after the 1-byte tag).  IBBBHH = u32 frame_id,
-# u8 reset_context, u8 mirror_x, u8 game_phase, u16 score_left, u16 score_right.
-_STATE_HEADER_FMT = "<IBBBHH"
+# State header format (after the 1-byte tag).  IBBBBHH = u32 frame_id,
+# u8 reset_context, u8 mirror_x, u8 game_phase, u8 match_end,
+# u16 score_left, u16 score_right.
+_STATE_HEADER_FMT = "<IBBBBHH"
 _STATE_HEADER_SIZE = struct.calcsize(_STATE_HEADER_FMT)
 _STATE_FEAT_BYTES = CORE_FEATURE_DIM * 4
 _STATE_BODY_SIZE = _STATE_HEADER_SIZE + _STATE_FEAT_BYTES
@@ -91,6 +95,7 @@ class StateFrame:
     reset_context: bool
     mirror_x: bool
     game_phase: int  # raw eGameState; reward shaping should gate on {4,5}
+    match_end: bool  # raw Metadata::addressMatchEnd byte — 0→1 triggers RESET
     score_left: int
     score_right: int
     core_features: np.ndarray  # shape (183,), dtype=float32
@@ -142,9 +147,8 @@ def unpack_state(body: bytes) -> StateFrame:
             f"STATE body wrong size: got {len(body)}, expected {_STATE_BODY_SIZE} "
             f"(header {_STATE_HEADER_SIZE} + features {_STATE_FEAT_BYTES})"
         )
-    frame_id, reset_b, mirror_b, game_phase, score_l, score_r = struct.unpack_from(
-        _STATE_HEADER_FMT, body, 0
-    )
+    (frame_id, reset_b, mirror_b, game_phase, match_end_b,
+     score_l, score_r) = struct.unpack_from(_STATE_HEADER_FMT, body, 0)
     feats = np.frombuffer(
         body, dtype=np.float32, count=CORE_FEATURE_DIM, offset=_STATE_HEADER_SIZE
     ).copy()  # copy so the caller can hold it past this socket read's lifetime
@@ -153,6 +157,7 @@ def unpack_state(body: bytes) -> StateFrame:
         reset_context=bool(reset_b),
         mirror_x=bool(mirror_b),
         game_phase=int(game_phase),
+        match_end=bool(match_end_b),
         score_left=score_l,
         score_right=score_r,
         core_features=feats,

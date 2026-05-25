@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import random
 import socket
 import subprocess
 import sys
@@ -63,6 +64,10 @@ DEFAULT_NORM_STATS = (
 DEFAULT_RUN_DIR = (
     r"C:\Users\Brian\Documents\SMS AI\runs\rl_phase_c"
 )
+
+# Number of stadium savestates available on the C++ side.  Keep in sync with
+# the kSavestateFiles array in Movie.cpp::InitAIControllerIpc.
+NUM_SAVESTATES = 3
 
 
 def _load_bc(
@@ -457,6 +462,22 @@ def main() -> int:
                             flush=True,
                         )
                     state, _drained = env.step(state.frame_id, out["btn_flags"], out["stick_vals"])
+                    # Match-end handling: when Dolphin signals match_end=1
+                    # (Strikers clock expired / mercy rule), load a random
+                    # stadium savestate so rollouts continue across an even
+                    # mix of arenas.  env.reset() drains pre-load packets
+                    # and blocks until the loaded state arrives.  Drained
+                    # frames are not folded into the chain — the current
+                    # action's reward window ends at the match-end frame.
+                    if state.match_end:
+                        sid = random.randrange(NUM_SAVESTATES)
+                        print(
+                            f"[diag] match_end frame_id={state.frame_id} "
+                            f"score={state.score_left}-{state.score_right}; "
+                            f"loading savestate id={sid}",
+                            flush=True,
+                        )
+                        state = env.reset(sid)
                     # Walk every transition in the chain, including drained
                     # intermediate frames, so turnovers/shots that happened
                     # in skipped frames still emit overlay events and

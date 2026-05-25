@@ -437,6 +437,15 @@ class RewardComputer:
         else:
             our_delta   = int(s_t1.score_left)  - int(s_t.score_left)
             their_delta = int(s_t1.score_right) - int(s_t.score_right)
+        # Savestate-load resets (match_end → loaded kickoff) rewind the
+        # scoreboard, producing negative deltas on a frame with
+        # is_resetting=True.  Legitimate post-goal-celebration credit on a
+        # reset boundary is always POSITIVE (a team's score went up during
+        # phase 2 and the delta surfaces here), so clamp negatives to 0
+        # on resets to suppress phantom rewards from savestate rollback.
+        if is_resetting:
+            our_delta   = max(our_delta,   0)
+            their_delta = max(their_delta, 0)
         reward += GOAL_REWARD * float(our_delta - their_delta)
         if our_delta:
             self._emit("GOAL_FOR",     GOAL_REWARD * our_delta)

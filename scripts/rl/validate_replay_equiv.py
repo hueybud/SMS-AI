@@ -140,6 +140,7 @@ def main() -> int:
             reset_context=False,
             mirror_x=False,
             game_phase=4,  # treat synthetic frames as active play
+            match_end=False,
             score_left=0,
             score_right=0,
             core_features=np.random.randn(CORE_FEATURE_DIM).astype(np.float32),

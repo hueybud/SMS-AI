@@ -130,19 +130,35 @@ class Env:
             raise RuntimeError("Env is closed")
         protocol.send_resume(self._sock)
 
-    def reset(self, savestate_id: int = 0) -> StateFrame:
-        """Ask Dolphin to reload a savestate.
+    def reset(self, savestate_id: int = 0, timeout_frames: int = 240) -> StateFrame:
+        """Ask Dolphin to reload a savestate, blocking until the load lands.
 
-        NOTE (Phase A): the C++ side currently logs the request and does not
-        actually load anything (TODO(rl-mvp) in Movie.cpp::InitAIControllerIpc).
-        Once the savestate plumbing lands, the next STATE packet will have
-        ``reset_context=True``.
+        ``savestate_id`` maps to a .sav file next to the Dolphin binary on
+        the C++ side (see Movie.cpp::InitAIControllerIpc).  Currently:
+        0=rl_palace.sav, 1=rl_underground.sav, 2=rl_battle_dome.sav.
+
+        The load happens on Dolphin's host thread via QueueHostJob, which
+        means an unknown number of pre-load STATE packets (potentially with
+        ``match_end=True``) can arrive before the savestate fires.  We
+        drain those packets until we see ``reset_context=True``, which
+        AIController sets on phase transitions — the post-load frame
+        transitions from post-match phase (0/3) into kickoff/active-play
+        (1/4/5), so that's our signal that the load completed.
         """
         if self._closed:
             raise RuntimeError("Env is closed")
         body = protocol.pack_reset(savestate_id)
         protocol.send_packet(self._sock, protocol.TAG_RESET, body)
-        return self.recv_state()
+        drained = 0
+        while drained < timeout_frames:
+            state = self.recv_state()
+            if state.reset_context:
+                return state
+            drained += 1
+        raise TimeoutError(
+            f"savestate {savestate_id} did not produce a reset_context=True "
+            f"STATE within {timeout_frames} frames"
+        )
 
     def close(self) -> None:
         """Stop responding. Doesn't tear down the Dolphin process — that's
