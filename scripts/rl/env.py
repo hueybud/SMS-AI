@@ -96,6 +96,18 @@ class Env:
         if self._closed:
             raise RuntimeError("Env is closed")
         self.send_action(frame_id, btn_probs, stick_vals)
+        return self.recv_fresh(drain=drain)
+
+    def recv_fresh(self, drain: bool = True) -> tuple[StateFrame, list[StateFrame]]:
+        """Block for the next STATE, then (optionally) drain any backlog.
+
+        Split out of ``step()`` so the batched env (rl/batch_env.py) can
+        scatter actions to all N workers first, then gather here — keeping
+        the same single-source drain semantics described in ``step()``.
+        Returns ``(freshest_state, intermediate_states_dropped)``.
+        """
+        if self._closed:
+            raise RuntimeError("Env is closed")
         state = self.recv_state()
         drained: list[StateFrame] = []
         if drain:
