@@ -196,3 +196,172 @@ class RLAgent:
         # starts from the same state we're peeking at).
         policy_t, _ = self.model.temporal.forward_cached(frame_emb, self.kv_cache)
         return float(self.model.value_head(policy_t).item())
+
+
+class BatchedRLAgent:
+    """N-env batched twin of :class:`RLAgent`.
+
+    Same math as ``RLAgent.act`` but vectorized over a batch dimension so
+    N parallel Dolphins are served by ONE forward pass per step instead of
+    N.  This is the throughput win step 4 (BatchedEnvironment) exists for:
+    the transformer forward dominates per-step wall-clock, and batching it
+    amortizes the fixed kernel-launch / Python overhead across all envs.
+
+    State layout mirrors ``RLAgent`` with a leading batch dim N:
+        kv_cache    : [L, 2, N, SEQ_LEN-1, TEMPORAL_DIM]
+        prev_labels : [N, PREV_ACTION_DIM]
+
+    The model itself is already batch-agnostic (EntityEncoder /
+    CausalTemporalTransformer.forward_cached / the heads all carry a
+    leading dim), so we feed it stacked features and slice the outputs
+    back out per env.
+
+    Per-env helpers (``reset_env``, ``snapshot_kv_per_env``,
+    ``snapshot_prev_labels_per_env``) let the trainer build one
+    ``Trajectory`` per env from the shared batched state.
+    """
+
+    def __init__(
+        self,
+        model: CitrusTransformerBC,
+        norm_mean: torch.Tensor,
+        norm_std: torch.Tensor,
+        device: torch.device,
+        num_envs: int,
+    ):
+        if num_envs <= 0:
+            raise ValueError(f"num_envs must be > 0, got {num_envs}")
+        self.model = model
+        self.device = device
+        self.n = num_envs
+        self.norm_mean = norm_mean.view(1, FEATURE_DIM).to(device)
+        self.norm_std = norm_std.view(1, FEATURE_DIM).to(device)
+        self.action_vocab = ACTION_VOCAB.to(device)
+
+        self.kv_cache = torch.zeros(
+            (TEMPORAL_LAYERS, 2, num_envs, SEQ_LEN - 1, TEMPORAL_DIM),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.prev_labels = np.zeros((num_envs, PREV_ACTION_DIM), dtype=np.float32)
+
+    # ----------------------------------------------------------------
+    # Per-env state management
+    # ----------------------------------------------------------------
+    def reset_env(self, i: int) -> None:
+        """Zero env ``i``'s KV slot + prev_labels (on reset_context)."""
+        self.kv_cache[:, :, i].zero_()
+        self.prev_labels[i].fill(0.0)
+
+    def reset_all(self) -> None:
+        self.kv_cache.zero_()
+        self.prev_labels.fill(0.0)
+
+    def snapshot_kv_per_env(self) -> list[np.ndarray]:
+        """One ``[L, 2, 1, SEQ_LEN-1, TEMPORAL_DIM]`` numpy copy per env,
+        matching ``Trajectory.initial_kv``.  Take BEFORE a rollout starts."""
+        kv = self.kv_cache.detach().cpu().numpy()
+        return [kv[:, :, i : i + 1].copy() for i in range(self.n)]
+
+    def snapshot_prev_labels_per_env(self) -> list[np.ndarray]:
+        return [self.prev_labels[i].copy() for i in range(self.n)]
+
+    @staticmethod
+    def _gumbel_like(logits: torch.Tensor) -> torch.Tensor:
+        return -torch.log(-torch.log(torch.rand_like(logits) + 1e-20) + 1e-20)
+
+    # ----------------------------------------------------------------
+    # Inference
+    # ----------------------------------------------------------------
+    def _build_features(self, states: list[StateFrame]) -> torch.Tensor:
+        """Stack N (core_features ++ prev_labels) rows → normalized [N, FD].
+
+        Per-row concatenate mirrors ``RLAgent.act`` exactly; np.stack will
+        raise if any row isn't FEATURE_DIM wide rather than silently
+        leaving uninitialized slots.
+        """
+        feats = np.stack(
+            [
+                np.concatenate([s.core_features, self.prev_labels[i]])
+                for i, s in enumerate(states)
+            ]
+        ).astype(np.float32)                                # [N, FEATURE_DIM]
+        feat_t = torch.from_numpy(feats).to(self.device)
+        return (feat_t - self.norm_mean) / self.norm_std
+
+    @torch.no_grad()
+    def act_batch(self, states: list[StateFrame]) -> list[ActOutput]:
+        if len(states) != self.n:
+            raise ValueError(f"expected {self.n} states, got {len(states)}")
+
+        # Reset KV/prev_labels for any env that just crossed a phase/match
+        # boundary — must happen BEFORE we read prev_labels into features.
+        for i, s in enumerate(states):
+            if s.reset_context:
+                self.reset_env(i)
+
+        feat_t = self._build_features(states)               # [N, FD]
+        entities = _flat_to_entities_onnx(feat_t)           # [N, n_ent, raw]
+        frame_emb = self.model.entity_encoder(entities)     # [N, D]
+        policy_t, kv_out = self.model.temporal.forward_cached(
+            frame_emb, self.kv_cache
+        )                                                   # [N, D], [L,2,N,S-1,D]
+
+        # ── Action head: 12-class categorical, Gumbel-max per row ───────
+        action_logits = self.model.ctrl_head.action_head(policy_t)   # [N, 12]
+        action_log_probs = F.log_softmax(action_logits, dim=-1)
+        action_probs = action_log_probs.exp()
+        action_idx = (action_logits + self._gumbel_like(action_logits)).argmax(dim=-1)  # [N]
+        lp_action = action_log_probs.gather(1, action_idx.unsqueeze(1)).squeeze(1)      # [N]
+        btn_flags = self.action_vocab[action_idx]            # [N, 7]
+
+        # ── Stick heads: 21-bin per axis, conditioned on action probs ───
+        stk_input = torch.cat([policy_t, action_probs], dim=-1)      # [N, D+12]
+        stick_bin_idx = torch.empty((self.n, STICK_DIM), dtype=torch.long, device=self.device)
+        stick_vals_t = torch.empty((self.n, STICK_DIM), dtype=torch.float32, device=self.device)
+        lp_sticks = torch.zeros(self.n, device=self.device)
+        for ax in range(STICK_DIM):
+            stk_logits = self.model.ctrl_head.stk_heads[ax](stk_input)   # [N, 21]
+            stk_log_probs = F.log_softmax(stk_logits, dim=-1)
+            bins = (stk_logits + self._gumbel_like(stk_logits)).argmax(dim=-1)   # [N]
+            stick_bin_idx[:, ax] = bins
+            stick_vals_t[:, ax] = bins.float() / (STICK_BINS - 1) * 2.0 - 1.0
+            lp_sticks += stk_log_probs.gather(1, bins.unsqueeze(1)).squeeze(1)
+
+        value = self.model.value_head(policy_t).squeeze(-1)  # [N]
+
+        # ── Commit internal state for next call ─────────────────────────
+        self.kv_cache = kv_out
+        btn_np = btn_flags.detach().cpu().numpy().astype(np.float32)     # [N, 7]
+        stick_np = stick_vals_t.detach().cpu().numpy().astype(np.float32)  # [N, 4]
+        self.prev_labels[:, :BUTTON_DIM] = btn_np
+        self.prev_labels[:, BUTTON_DIM : BUTTON_DIM + STICK_DIM] = stick_np
+
+        # ── Slice batched tensors back into per-env outputs ─────────────
+        action_idx_np = action_idx.detach().cpu().numpy()
+        stick_bin_np = stick_bin_idx.detach().cpu().numpy()
+        lp_total = (lp_action + lp_sticks).detach().cpu().numpy()
+        value_np = value.detach().cpu().numpy()
+        outs: list[ActOutput] = []
+        for i in range(self.n):
+            outs.append(ActOutput(
+                action_idx=int(action_idx_np[i]),
+                stick_bin_idx=stick_bin_np[i].astype(np.int64),
+                btn_flags=btn_np[i],
+                stick_vals=stick_np[i],
+                log_prob=float(lp_total[i]),
+                value=float(value_np[i]),
+            ))
+        return outs
+
+    @torch.no_grad()
+    def value_only_batch(self, states: list[StateFrame]) -> np.ndarray:
+        """``V(s)`` for each env without mutating KV/prev_labels.  Used for
+        the per-env ``last_value`` arg to ``compute_gae`` at rollout end."""
+        if len(states) != self.n:
+            raise ValueError(f"expected {self.n} states, got {len(states)}")
+        feat_t = self._build_features(states)
+        entities = _flat_to_entities_onnx(feat_t)
+        frame_emb = self.model.entity_encoder(entities)
+        policy_t, _ = self.model.temporal.forward_cached(frame_emb, self.kv_cache)
+        return self.model.value_head(policy_t).squeeze(-1).detach().cpu().numpy()
