@@ -1,23 +1,32 @@
 """Dolphin subprocess wrapper for IPC inference.
 
-One ``Dolphin`` instance == one Dolphin process == one env. Multi-env later
-batches N of these (with N picked ports). Mirrors slippi-ai's ``dolphin.py``
-shape, minus the menu helper / controller objects we don't need (IPC
-subsumes both — see ``rl_gym_design.md`` section 4).
+One ``Dolphin`` instance == one Dolphin process == one env. Multi-env scale-out
+on ThunderCompute uses ``BatchedEnvironment`` (rl/batch_env.py) which holds
+N of these in parallel, each with a distinct ``worker_id`` driving its port,
+user-dir, and log file.
 
-Phase A: launches the regular windowed ``Dolphin.exe`` (the build we
-already validate against). Headless / DolphinNoGUI is a follow-up once
-batched envs and savestate-on-boot are in.
+Two run modes share the same surface:
+
+* ``headless=False`` (default) — launches the windowed ``Citrus Dolphin.exe``
+  and patches a single shared ``Dolphin.ini``.  Used for Windows BC validation
+  and single-env eyeballing during development.  Original ``[Movie] AIIpcPort``
+  is restored on close.
+* ``headless=True`` — launches ``dolphin-emu-nogui -p headless`` with a
+  per-worker ``-u <tmpdir>`` so each worker writes a fresh INI (null video,
+  null audio, unlimited emulation speed, IPC port wired).  Boots straight
+  into a savestate via ``--save_state=...``, skipping menu nav.  No shared
+  INI to fight over → safe for N parallel processes.
 
 Lifecycle::
 
-    with Dolphin(iso_path=...) as d:
+    with Dolphin(iso_path=..., headless=True, worker_id=0,
+                 savestate_path="rl_palace.sav") as d:
         env = Env(d.socket)
         ...
 
-The context manager handles: pick port -> patch INI -> launch subprocess
--> connect with retry -> [body] -> SHUTDOWN packet -> close socket -> wait
--> restore INI.
+The context manager handles: pick port -> write/patch INI -> launch
+subprocess -> connect with retry -> [body] -> SHUTDOWN packet -> close
+socket -> wait -> restore INI (windowed only).
 """
 
 from __future__ import annotations
@@ -26,6 +35,7 @@ import configparser
 import os
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -35,8 +45,7 @@ import portpicker
 from . import protocol
 
 
-# Windowed Dolphin (the build we work with day-to-day). Phase A uses this
-# so the user can navigate to a kickoff manually and see the AI react.
+# Windowed Dolphin (Windows BC validation default).
 DEFAULT_DOLPHIN_EXE = (
     r"C:\Users\Brian\source\repos\Project-Citrus2\Binary\x64\Citrus Dolphin.exe"
 )
@@ -44,74 +53,155 @@ DEFAULT_DOLPHIN_INI = Path(
     r"C:\Users\Brian\Documents\Dolphin Emulator\Config\Dolphin.ini"
 )
 
+# Headless Linux defaults — convention from `linux_compat.md`.  Override
+# explicitly when the build lives elsewhere on ThunderCompute.
+DEFAULT_NOGUI_EXE = "/root/Project-Citrus2/build/Binaries/dolphin-emu-nogui"
+
+# Base port for deterministic multi-env allocation.  worker_id N gets
+# port BASE + N.  Pinning to a range (vs portpicker's roaming) prevents
+# collisions between simultaneous training jobs on the same instance
+# (ThunderCompute docs: "container network is NOT isolated").
+HEADLESS_BASE_PORT = 51000
+
 
 class Dolphin:
-    """A windowed Dolphin subprocess wired up for IPC.
+    """One Dolphin subprocess wired up for IPC.
 
     Parameters
     ----------
     iso_path
         Game ISO to boot.  Must be readable by Dolphin.
     ipc_port
-        TCP port the IpcBackend listens on.  ``None`` => pick a free port.
+        TCP port the IpcBackend listens on.  ``None`` => pick.  Picking
+        rules: in headless mode, ``HEADLESS_BASE_PORT + worker_id``
+        (deterministic, range-pinned).  In windowed mode, ``portpicker``.
     dolphin_exe
-        Path to ``Dolphin.exe``.  Phase A defaults to the windowed build;
-        switch to ``DolphinNoGUI.exe`` once headless validation lands.
+        Path to the Dolphin binary.  ``None`` => DEFAULT_DOLPHIN_EXE
+        (windowed) or DEFAULT_NOGUI_EXE (headless).
     dolphin_ini
-        Path to the user-config Dolphin.ini whose ``[Movie] AIIpcPort``
-        we'll patch.  Restored on close.
+        Path to the shared ``Dolphin.ini`` to patch (windowed mode only).
+        Ignored in headless mode — each worker writes its own INI to
+        ``user_dir/Config/Dolphin.ini``.
     extra_args
-        Extra CLI args to append (e.g. ``["-v", "Null", "-a", "NoAudio"]``
-        once you go headless).  Empty by default — the user's INI controls
-        video/audio backends.
+        Extra CLI args appended to the launch command.  Headless mode
+        already supplies ``-p headless``, ``-e <iso>``, ``-u <tmpdir>``,
+        and ``--save_state=...`` — don't duplicate those.
     connect_timeout_s
-        How long to retry-connect before giving up.  Strikers can take
-        ~5-15s to boot on a cold cache.
+        How long to retry-connect.  Strikers boots in ~5-15s windowed;
+        headless with a savestate-boot is similar (the savestate applies
+        before the game finishes initializing video/audio, but the IPC
+        listener binds during Movie::Init regardless).
     log_passthrough
-        ``True`` => Dolphin's stdout/stderr go to this process's terminal
-        (useful for debugging).  ``False`` => silenced.
+        ``True`` => inherit stdout/stderr (windowed default).
+        ``False`` => silenced (or redirected if ``log_file`` is set).
+    log_file
+        Per-worker stdout/stderr destination (headless multi-env).
+        Overrides ``log_passthrough``.  Parent dir must exist.
     keep_alive
-        ``True`` => on close, only tear down the IPC socket + restore INI;
-        leave the Dolphin subprocess running (the user can keep poking the
-        log window, then close manually).  ``False`` (default) => wait for
-        graceful exit then kill if needed.
+        Leave the Dolphin subprocess running on close (used for log
+        inspection after a smoke test).
+    headless
+        ``True`` => nogui + per-worker user dir + boot-via-savestate.
+    worker_id
+        0-indexed worker number.  Drives port and user-dir choice in
+        headless mode; ignored in windowed mode.
+    savestate_path
+        Path to a .sav file to boot into via ``--save_state=...``.
+        Required in headless mode (no human to navigate menus).
+        Optional in windowed mode (you'll navigate manually).
+    user_dir
+        Override the per-worker user directory (headless mode).
+        ``None`` => ``/tmp/citrus_env_<worker_id>``.  The directory is
+        created if missing; its INI is overwritten every launch.
+    ai_controlled_port
+        GC port the AI controls (passed through to ``[Movie]
+        AIControlledPort``).  Default 0 matches our setup (AI on P1).
+    ai_mirror_x
+        ``[Movie] AIMirrorX`` value.  Default False matches our captured
+        savestates (Daisy/Toad on the LEFT, mirror flipping not needed).
     """
 
     def __init__(
         self,
         iso_path: str,
         ipc_port: Optional[int] = None,
-        dolphin_exe: str = DEFAULT_DOLPHIN_EXE,
+        dolphin_exe: Optional[str] = None,
         dolphin_ini: Path = DEFAULT_DOLPHIN_INI,
         extra_args: Optional[list[str]] = None,
         connect_timeout_s: float = 30.0,
         log_passthrough: bool = True,
+        log_file: Optional[Path] = None,
         keep_alive: bool = False,
+        headless: bool = False,
+        worker_id: int = 0,
+        savestate_path: Optional[str] = None,
+        user_dir: Optional[Path] = None,
+        ai_controlled_port: int = 0,
+        ai_mirror_x: bool = False,
     ):
         self.iso_path = str(iso_path)
-        self.ipc_port = ipc_port if ipc_port is not None else portpicker.pick_unused_port()
-        self.dolphin_exe = dolphin_exe
+        self.headless = headless
+        self.worker_id = worker_id
+        self.savestate_path = str(savestate_path) if savestate_path else None
+        self.ai_controlled_port = ai_controlled_port
+        self.ai_mirror_x = ai_mirror_x
+
+        # Port selection.
+        if ipc_port is not None:
+            self.ipc_port = ipc_port
+        elif headless:
+            self.ipc_port = HEADLESS_BASE_PORT + worker_id
+        else:
+            self.ipc_port = portpicker.pick_unused_port()
+
+        # Executable.
+        if dolphin_exe is not None:
+            self.dolphin_exe = dolphin_exe
+        else:
+            self.dolphin_exe = DEFAULT_NOGUI_EXE if headless else DEFAULT_DOLPHIN_EXE
+
+        # User directory (headless only).
+        if headless:
+            if user_dir is not None:
+                self.user_dir = Path(user_dir)
+            else:
+                self.user_dir = Path(f"/tmp/citrus_env_{worker_id}")
+        else:
+            self.user_dir = None
+
         self.dolphin_ini = Path(dolphin_ini)
         self.extra_args = list(extra_args) if extra_args else []
         self.connect_timeout_s = connect_timeout_s
         self.log_passthrough = log_passthrough
+        self.log_file = Path(log_file) if log_file else None
         self.keep_alive = keep_alive
 
         self._proc: Optional[subprocess.Popen] = None
         self._sock: Optional[socket.socket] = None
         self._original_ipc_port: Optional[str] = None
+        self._log_fh = None
+
+        # Sanity checks.
+        if headless and not self.savestate_path:
+            raise ValueError(
+                "headless=True requires savestate_path (no menu nav possible)"
+            )
 
     # ------------------------------------------------------------------
-    # INI patching
+    # INI handling
     # ------------------------------------------------------------------
-    def _patch_ini(self, port: int) -> None:
+    def _patch_windowed_ini(self, port: int) -> None:
+        """Windowed mode: patch [Movie] AIIpcPort in the user's shared INI.
+
+        Restored on close so day-to-day BC play isn't disrupted.
+        """
         if not self.dolphin_ini.exists():
             raise FileNotFoundError(
                 f"Dolphin.ini not found at {self.dolphin_ini}; launch Dolphin "
                 f"once to create it, or pass dolphin_ini=..."
             )
         cp = configparser.ConfigParser(strict=False, interpolation=None)
-        cp.optionxform = str  # preserve original key casing (Dolphin is case-sensitive)
+        cp.optionxform = str  # preserve key casing (Dolphin is case-sensitive)
         cp.read(self.dolphin_ini, encoding="utf-8")
         if not cp.has_section("Movie"):
             cp.add_section("Movie")
@@ -120,7 +210,7 @@ class Dolphin:
         with open(self.dolphin_ini, "w", encoding="utf-8") as f:
             cp.write(f, space_around_delimiters=False)
 
-    def _restore_ini(self) -> None:
+    def _restore_windowed_ini(self) -> None:
         if self._original_ipc_port is None:
             return
         try:
@@ -135,32 +225,129 @@ class Dolphin:
         finally:
             self._original_ipc_port = None
 
+    def _write_headless_ini(self, port: int) -> None:
+        """Headless mode: write a fresh per-worker INI into user_dir/Config/.
+
+        Each worker's INI is independent (no shared state, no patch race).
+        Contents are deterministic per worker — overwriting is the point.
+
+        Config keys set here mirror what BootManager + MovieConfigLoader
+        consult on Strikers boot.  Notably ``[Core] GFXBackend=Null`` and
+        ``[DSP] Backend=No Audio Output`` cut all rendering / audio work,
+        and ``[Core] EmulationSpeed=0`` runs the JIT as fast as the host
+        allows.
+        """
+        assert self.user_dir is not None
+        config_dir = self.user_dir / "Config"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        ini_path = config_dir / "Dolphin.ini"
+
+        cp = configparser.ConfigParser(strict=False, interpolation=None)
+        cp.optionxform = str
+
+        cp["Core"] = {
+            "GFXBackend": "Null",
+            "EmulationSpeed": "0",  # 0 = unlimited
+            # CPU thread on, JIT64, DSP HLE — defaults that work on Linux x86_64.
+            "CPUThread": "True",
+            "CPUCore": "1",  # Cached Interpreter on ARM, JIT64 on x86
+            "DSPHLE": "True",
+            "FastDiscSpeed": "True",
+        }
+        cp["DSP"] = {
+            "Backend": "No Audio Output",
+        }
+        cp["Movie"] = {
+            "AIIpcPort": str(port),
+            "AIControlledPort": str(self.ai_controlled_port),
+            "AIMirrorX": "True" if self.ai_mirror_x else "False",
+            "AIPanicAlerts": "False",  # suppress panic dialogs (headless = no GUI to ack)
+            # UseNullBackend is a Citrus hack that forces Null GFXBackend +
+            # unlimited speed during DTM playback (BootManager.cpp:78,
+            # MovieConfigLoader.cpp:35).  Our RL flow boots savestates, not
+            # DTMs, so this is technically a no-op for us — the [Core]
+            # settings above already pin Null/unlimited.  Set anyway as
+            # belt-and-suspenders insurance against any runtime path that
+            # would otherwise restore a non-Null backend on savestate load.
+            "UseNullBackend": "True",
+        }
+        # Disable analytics prompts and update checks — headless boxes can't
+        # answer dialogs.
+        cp["Analytics"] = {
+            "Enabled": "False",
+            "PermissionAsked": "True",
+        }
+        cp["General"] = {
+            "ShowLag": "False",
+            "ShowFrameCount": "False",
+        }
+
+        with open(ini_path, "w", encoding="utf-8") as f:
+            cp.write(f, space_around_delimiters=False)
+
     # ------------------------------------------------------------------
     # Subprocess + socket
     # ------------------------------------------------------------------
     def _build_cmd(self) -> list[str]:
-        # Windowed Dolphin: -e auto-boots the ISO.  Video/audio backends
-        # come from the user's Dolphin.ini.  We deliberately do NOT pass
-        # -b (batch) so the main launcher/log window stays available for
-        # debugging during Phase A; teardown is handled via SHUTDOWN
-        # packet + subprocess kill on Python side.
-        return [self.dolphin_exe, "-e", self.iso_path, *self.extra_args]
+        if self.headless:
+            assert self.user_dir is not None
+            assert self.savestate_path is not None
+            cmd = [
+                self.dolphin_exe,
+                "-p", "headless",
+                "-u", str(self.user_dir),
+                "-e", self.iso_path,
+                "-s", self.savestate_path,
+                *self.extra_args,
+            ]
+        else:
+            # Windowed: -e auto-boots the ISO.  Video/audio come from the
+            # user's INI.  No -b (batch) because that suppresses the
+            # launcher/log window we want during interactive Phase A/B work.
+            cmd = [self.dolphin_exe, "-e", self.iso_path, *self.extra_args]
+        return cmd
 
     def start(self) -> None:
         if not Path(self.dolphin_exe).exists():
             raise FileNotFoundError(f"Dolphin exe not found at {self.dolphin_exe}")
         if not Path(self.iso_path).exists():
             raise FileNotFoundError(f"ISO not found at {self.iso_path}")
+        if self.savestate_path and not Path(self.savestate_path).exists():
+            raise FileNotFoundError(f"savestate not found at {self.savestate_path}")
 
-        self._patch_ini(self.ipc_port)
+        if self.headless:
+            self._write_headless_ini(self.ipc_port)
+        else:
+            self._patch_windowed_ini(self.ipc_port)
 
         cmd = self._build_cmd()
-        print(f"[Dolphin] launching on port {self.ipc_port}: {' '.join(cmd)}", flush=True)
+        print(
+            f"[Dolphin{f'#{self.worker_id}' if self.headless else ''}] "
+            f"launching on port {self.ipc_port}: {' '.join(cmd)}",
+            flush=True,
+        )
 
-        # Inherit stdout/stderr by default so the user can see Dolphin's
-        # logs (notably "AIController: IPC active on port N").
-        stdio = None if self.log_passthrough else subprocess.DEVNULL
-        self._proc = subprocess.Popen(cmd, stdout=stdio, stderr=stdio)
+        # stdout/stderr routing.  log_file overrides log_passthrough.
+        if self.log_file is not None:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
+            self._log_fh = open(self.log_file, "w", encoding="utf-8", buffering=1)
+            stdout = self._log_fh
+            stderr = subprocess.STDOUT
+        elif self.log_passthrough:
+            stdout = None
+            stderr = None
+        else:
+            stdout = subprocess.DEVNULL
+            stderr = subprocess.DEVNULL
+
+        # Detach into its own process group so SIGINT to the trainer
+        # doesn't take down a wedged Dolphin we'd otherwise want to clean
+        # up explicitly via SHUTDOWN packet + kill.
+        popen_kwargs = dict(stdout=stdout, stderr=stderr)
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+
+        self._proc = subprocess.Popen(cmd, **popen_kwargs)
 
     def connect(self) -> socket.socket:
         if self._proc is None:
@@ -175,40 +362,25 @@ class Dolphin:
             if self._proc.poll() is not None:
                 raise RuntimeError(
                     f"Dolphin exited before IPC accept (rc={self._proc.returncode}); "
-                    f"check the Dolphin logs above"
+                    f"check the Dolphin logs"
+                    + (f" at {self.log_file}" if self.log_file else " above")
                 )
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                # IMPORTANT: blocking connect, no per-attempt timeout.
-                #
-                # An emulated timeout (settimeout(1.0) before connect) has a
-                # nasty race on loopback where the kernel completes the TCP
-                # handshake at almost the same instant Python decides to
-                # abort.  Symptom: C++ AcceptLoop logs "client connected"
-                # for THIS attempt, then ~100ms later sees "peer closed
-                # (orderly FIN)" when the timed-out Python socket gets
-                # garbage-collected.  The next attempt produces a new TCP
-                # connection that succeeds at the kernel level but is
-                # orphaned (C++'s AcceptLoop already exited), and Python
-                # blocks forever on a half-alive socket.
-                #
-                # Blocking connect on loopback either succeeds in
-                # microseconds (port bound + listening) or fails fast with
-                # ConnectionRefusedError (nothing listening yet — kernel
-                # sends RST).  No race.
+                # IMPORTANT: blocking connect, no per-attempt timeout — see
+                # feedback_ipc_connect_race for the kernel/userspace race
+                # that orphans connections under settimeout().
                 s.connect(("127.0.0.1", self.ipc_port))
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self._sock = s
                 print(
-                    f"[Dolphin] connected on port {self.ipc_port} "
-                    f"after {attempt} attempts",
+                    f"[Dolphin{f'#{self.worker_id}' if self.headless else ''}] "
+                    f"connected on port {self.ipc_port} after {attempt} attempts",
                     flush=True,
                 )
                 return s
             except (ConnectionRefusedError, OSError) as e:
                 last_err = e
-                # Explicitly close to ensure the kernel tears the fd down
-                # immediately, not whenever GC decides to run.
                 try:
                     s.close()
                 except OSError:
@@ -254,15 +426,12 @@ class Dolphin:
                 pass
             self._sock = None
 
-        # 3. Wait + kill subprocess unless we were asked to leave it running
-        #    (e.g. for log inspection after the smoke test).  Note: on
-        #    Windows, child processes outlive a Python parent that exits, so
-        #    detaching by setting _proc=None is enough — Dolphin keeps running.
+        # 3. Wait + kill subprocess unless we were asked to leave it running.
         if self._proc is not None:
             if self.keep_alive:
                 print(
-                    f"[Dolphin] keep_alive=True; leaving pid={self._proc.pid} running. "
-                    f"Close the Dolphin window when done.",
+                    f"[Dolphin{f'#{self.worker_id}' if self.headless else ''}] "
+                    f"keep_alive=True; leaving pid={self._proc.pid} running.",
                     flush=True,
                 )
                 self._proc = None
@@ -271,8 +440,8 @@ class Dolphin:
                     self._proc.wait(timeout=wait_s)
                 except subprocess.TimeoutExpired:
                     print(
-                        f"[Dolphin] subprocess did not exit within {wait_s}s; "
-                        f"killing pid={self._proc.pid}",
+                        f"[Dolphin{f'#{self.worker_id}' if self.headless else ''}] "
+                        f"subprocess did not exit within {wait_s}s; killing pid={self._proc.pid}",
                         flush=True,
                     )
                     self._proc.kill()
@@ -282,10 +451,18 @@ class Dolphin:
                         pass
                 self._proc = None
 
-        # 4. Restore Dolphin.ini AIIpcPort to whatever it was before we patched.
-        #    Safe even with keep_alive: the running Dolphin already read the
-        #    INI at boot, so restoring now only affects future launches.
-        self._restore_ini()
+        # 4. Close per-worker log file if we opened one.
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
+            self._log_fh = None
+
+        # 5. Windowed: restore shared INI.  Headless: per-worker INI is
+        #    disposable, leave it for post-mortem inspection.
+        if not self.headless:
+            self._restore_windowed_ini()
 
     # ------------------------------------------------------------------
     # Context manager
