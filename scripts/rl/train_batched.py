@@ -247,6 +247,13 @@ def main() -> int:
         "wallclock", "cycle", "total_frames", "update_tag",
         "collect_s", "update_s", "num_envs",
         "reward_sum", "reward_events",
+        # Explicit goal tracking (decouples scoring signal from total reward,
+        # which conflates +1.0 goal terminals with smaller shaping events).
+        # Counted from chain score deltas; misses goals that coincide with
+        # the same frame as match_end (synthetic state is overwritten by
+        # reset in BatchedEnvironment.step), but the vast majority of goals
+        # happen mid-match and ARE caught.
+        "goals_for", "goals_against", "goal_diff", "matches_reset",
         "adv_mean", "adv_std",
         "loss_total", "loss_ppo", "loss_value", "loss_kl_teacher",
         "loss_entropy", "rho_mean", "log_rho_abs_max", "grad_norm",
@@ -283,6 +290,13 @@ def main() -> int:
             act_times: list = []
             drained_at_start = benv.total_drained
             per_env_rewards: list = [[] for _ in range(args.num_envs)]
+            # Cycle-scope goal counters (computed from chain score deltas).
+            # mirror_x=False (default; matches the canonical savestate
+            # captures) means AI plays LEFT, so score_left increases are
+            # goals FOR and score_right increases are goals AGAINST.
+            cycle_goals_for = 0
+            cycle_goals_against = 0
+            cycle_matches_reset = 0
 
             # ── Collect one cycle: each buffer fills to rollout_length ───
             # Sync pacing keeps the envs lockstep — they all reach full at
@@ -311,16 +325,33 @@ def main() -> int:
 
                 # Per-env: reward over the chain (prev → drained... → next)
                 # and push the next state into that env's trajectory buffer.
+                # Also tally goals: score increases between consecutive
+                # chain states are goals (signed by mirror_x); reset
+                # transitions zero the score and are skipped.
                 for e in range(args.num_envs):
                     chain = [prev_states[e]] + drained_lists[e] + [next_states[e]]
-                    step_reward = sum(
-                        rcs[e].step(
-                            chain[i], chain[i + 1],
-                            bool(chain[i + 1].reset_context),
+                    step_reward = 0.0
+                    for i in range(len(chain) - 1):
+                        a, b = chain[i], chain[i + 1]
+                        step_reward += rcs[e].step(
+                            a, b,
+                            bool(b.reset_context),
                             intended_stick=outs[e]["stick_vals"],
                         )
-                        for i in range(len(chain) - 1)
-                    )
+                        if b.reset_context:
+                            cycle_matches_reset += 1
+                            continue
+                        # AI side = LEFT when mirror_x=False, RIGHT when True.
+                        if mirror_x:
+                            f_delta = b.score_right - a.score_right
+                            a_delta = b.score_left  - a.score_left
+                        else:
+                            f_delta = b.score_left  - a.score_left
+                            a_delta = b.score_right - a.score_right
+                        if f_delta > 0:
+                            cycle_goals_for     += f_delta
+                        if a_delta > 0:
+                            cycle_goals_against += a_delta
                     per_env_rewards[e].append(step_reward)
                     buffers[e].push_state(next_states[e])
 
@@ -388,9 +419,12 @@ def main() -> int:
                 t_update = time.monotonic() - t_update_start
                 batch_trajs = []
 
+            goal_diff = cycle_goals_for - cycle_goals_against
             line = (
                 f"[train-batched] cycle={cycle_idx - 1:5d} {update_tag} "
                 f"frames={total_frames:9d} "
+                f"goals={cycle_goals_for}-{cycle_goals_against} "
+                f"(diff={goal_diff:+d}, {cycle_matches_reset} resets) "
                 f"reward_sum={reward_sum:+.2f} events={reward_events:3d} "
                 f"adv_mean={float(adv_concat.mean()):+.3f} "
                 f"loss={metrics['loss/total']:+.4f} "
@@ -409,6 +443,8 @@ def main() -> int:
                 cycle_idx - 1, total_frames, update_tag,
                 f"{t_collect:.3f}", f"{t_update:.3f}", args.num_envs,
                 f"{reward_sum:.4f}", reward_events,
+                cycle_goals_for, cycle_goals_against, goal_diff,
+                cycle_matches_reset,
                 f"{float(adv_concat.mean()):.4f}",
                 f"{float(adv_concat.std()):.4f}",
                 f"{metrics['loss/total']:.4f}",
