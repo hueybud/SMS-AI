@@ -108,16 +108,27 @@ class BatchedEnvironment:
         # the in-progress rollout cycle (per-env trajectory partial data is
         # not salvageable once that env reset to a fresh savestate).
         self.restarted_this_step: list[int] = []
-        # Stagnation detection: Dolphin can wedge after a savestate load
-        # (game CPU thread stalls but VI hooks keep firing, so the IPC
-        # still responds with the same frame_id forever — symptom is
-        # FPS=0 / VPS>0 in the worker's OSD log).  The socket is alive
-        # so our normal auto-restart doesn't catch it.  Detect by
-        # counting consecutive steps where frame_id doesn't advance
-        # without a reset_context; force-restart once the count exceeds
-        # the threshold (~2.5s wall-clock at sync-paced step rates).
+        # Stagnation detection: Dolphin can wedge in two distinct modes
+        # after a savestate load, both showing FPS=0 in the OSD:
+        #
+        # (a) Full CPU stall — game JIT + VI hooks all stop.  frame_id
+        #     stops advancing.  Detected by frame_id repeats.
+        # (b) "FPS=0 / VPS>0" partial stall — game CPU thread is stuck
+        #     but VI interrupts keep ticking OnFrameEnd, so frame_id
+        #     keeps incrementing.  The game state ISN'T advancing
+        #     though, so core_features come back bit-identical across
+        #     STATEs.  Detected by features.tobytes() repeats.
+        #
+        # Either mode produces the same visible bug: no useful game
+        # progress + the existing socket-watching auto-restart misses
+        # both (socket is alive in both cases).  Trigger force-restart
+        # once consecutive-no-progress steps exceed the threshold.
         self.no_progress_steps: list[int] = [0] * num_envs
-        self.no_progress_threshold: int = 100
+        self.no_progress_threshold: int = 60
+        # Most recent core_features per env, for mode (b) detection.
+        # Set to None when an env is fresh / just-restarted so the next
+        # comparison is unambiguous.
+        self.last_core_features: list = [None] * num_envs
 
         self.dolphins: list[Dolphin] = [
             Dolphin(
@@ -321,28 +332,43 @@ class BatchedEnvironment:
                       f"{type(e).__name__}: {e}", flush=True)
                 failed.add(i)
 
-        # 4. Stagnation detection: a Dolphin can wedge post-savestate-load
-        # (CPU thread stalled, VI hooks still firing).  The socket is alive
-        # so the failures in steps 1-3 don't catch it, but frame_id stops
-        # advancing.  Force-restart envs that haven't moved for too many
-        # consecutive steps without a reset_context.  Skip envs already
-        # marked failed above — they're getting restarted anyway.
+        # 4. Stagnation detection — see __init__ for the two wedge modes
+        # this catches.  We check BOTH frame_id repeats (mode a, full CPU
+        # stall) and bit-identical core_features (mode b, VI-only ticks,
+        # OSD: FPS=0/VPS>0).  Either pattern triggers force-restart once
+        # it persists past the threshold.  Skip envs already in `failed`
+        # — they're getting restarted anyway and the bookkeeping below
+        # resets their state cleanly.
         for i in range(self.n):
             if i in failed:
                 self.no_progress_steps[i] = 0
+                self.last_core_features[i] = None
                 continue
             new = next_states[i]
-            if not new.reset_context and new.frame_id == self.states[i].frame_id:
+            if new.reset_context:
+                self.no_progress_steps[i] = 0
+                self.last_core_features[i] = new.core_features
+                continue
+            frame_stalled = (new.frame_id == self.states[i].frame_id)
+            features_stalled = (
+                self.last_core_features[i] is not None
+                and new.core_features.tobytes()
+                    == self.last_core_features[i].tobytes()
+            )
+            if frame_stalled or features_stalled:
                 self.no_progress_steps[i] += 1
                 if self.no_progress_steps[i] >= self.no_progress_threshold:
+                    mode = "frame_id" if frame_stalled else "features"
                     print(f"[BatchedEnv] env {i}: STAGNATION "
-                          f"({self.no_progress_steps[i]} steps stuck at "
-                          f"frame_id={new.frame_id}); forcing restart",
-                          flush=True)
+                          f"({self.no_progress_steps[i]} steps stuck via "
+                          f"{mode} check, frame_id={new.frame_id}); "
+                          f"forcing restart", flush=True)
                     failed.add(i)
                     self.no_progress_steps[i] = 0
+                    self.last_core_features[i] = None
             else:
                 self.no_progress_steps[i] = 0
+                self.last_core_features[i] = new.core_features
 
         # 5. Restart any envs that failed.  Pause the alive envs first so
         # they don't free-run + pile up backlog while we relaunch (which
