@@ -86,6 +86,7 @@ class BatchedEnvironment:
         log_dir: Optional[Path] = None,
         connect_timeout_s: float = 60.0,
         first_state_timeout_s: float = 600.0,
+        max_restarts_per_env: int = 5,
     ):
         if num_envs <= 0:
             raise ValueError(f"num_envs must be > 0, got {num_envs}")
@@ -95,6 +96,18 @@ class BatchedEnvironment:
         self.log_dir = Path(log_dir) if log_dir else None
         if self.log_dir is not None:
             self.log_dir.mkdir(parents=True, exist_ok=True)
+        # Auto-restart: when a worker's socket dies (send/recv/reset error
+        # mid-step), tear it down and relaunch in place. ``max_restarts_per_env``
+        # is the circuit breaker — if one env hits this many crashes, something
+        # is persistently broken with that worker (port collision, OOM, bad
+        # savestate) and we'd rather fail loudly than loop forever.
+        self.max_restarts_per_env = max_restarts_per_env
+        self.env_restart_count: list[int] = [0] * num_envs
+        # Indices restarted during the most recent step() call. The trainer
+        # reads this immediately after step() to decide whether to discard
+        # the in-progress rollout cycle (per-env trajectory partial data is
+        # not salvageable once that env reset to a fresh savestate).
+        self.restarted_this_step: list[int] = []
 
         self.dolphins: list[Dolphin] = [
             Dolphin(
@@ -234,23 +247,169 @@ class BatchedEnvironment:
         default 0) before returning, so its rollout continues.  The
         post-reset state replaces the match-end state in the returned list.
 
+        **Resilience:** per-env failures during send/recv/reset are caught
+        and trigger ``_restart_env(i)`` instead of bubbling up.  Indices
+        that were restarted appear in ``self.restarted_this_step``; the
+        trainer should treat those envs as having reset and discard any
+        partial in-progress trajectory data for them (simplest: discard the
+        whole cycle, since lockstep is broken otherwise).
+
         Updates ``self.states`` to the gathered (post-reset) states and
         returns ``(next_states, per_env_drained_lists)``.
         """
-        self.send_actions(outs)
-        next_states, drained_lists = self.gather_states(drain=drain)
-        for i, s in enumerate(next_states):
-            if s.match_end:
-                sid = savestate_picker(i) if savestate_picker else 0
-                # Preserve the match-end terminal state in this env's chain
-                # before reset() overwrites it. Without this, a goal that
-                # also ended the match (mercy rule, buzzer-beater) would be
-                # invisible: the synthetic match_end frame carries the final
-                # score, and the post-reset frame carries 0-0.
-                drained_lists[i].append(s)
+        self.restarted_this_step = []
+
+        # 1. Scatter sends.  Per-env failures push the env onto failed[].
+        failed: set[int] = set()
+        for i in range(self.n):
+            try:
+                self.envs[i].send_action(
+                    self.states[i].frame_id,
+                    outs[i]["btn_flags"],
+                    outs[i]["stick_vals"],
+                )
+            except (OSError, ConnectionError) as e:
+                print(f"[BatchedEnv] env {i}: send_action failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                failed.add(i)
+
+        # 2. Gather recvs (skip envs we've already failed on).
+        next_states = list(self.states)
+        drained_lists: list[list[StateFrame]] = [[] for _ in range(self.n)]
+        for i in range(self.n):
+            if i in failed:
+                continue
+            try:
+                s, d = self.envs[i].recv_fresh(drain=drain)
+                next_states[i] = s
+                drained_lists[i] = d
+            except (OSError, ConnectionError) as e:
+                print(f"[BatchedEnv] env {i}: recv_fresh failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                failed.add(i)
+
+        # 3. Match-end resets (skip envs we've already failed on).  These can
+        # also fail (TimeoutError if the savestate doesn't produce
+        # reset_context within 240 frames).
+        for i in range(self.n):
+            if i in failed:
+                continue
+            s = next_states[i]
+            if not s.match_end:
+                continue
+            sid = savestate_picker(i) if savestate_picker else 0
+            # Preserve the match-end terminal state in this env's chain
+            # before reset() overwrites it.  Without this, a goal that
+            # also ended the match (mercy rule, buzzer-beater) would be
+            # invisible: the synthetic match_end frame carries the final
+            # score, and the post-reset frame carries 0-0.
+            drained_lists[i].append(s)
+            try:
                 next_states[i] = self.envs[i].reset(sid)
+            except (OSError, ConnectionError, TimeoutError) as e:
+                print(f"[BatchedEnv] env {i}: match-end reset failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
+                failed.add(i)
+
+        # 4. Restart any envs that failed.  Pause the alive envs first so
+        # they don't free-run + pile up backlog while we relaunch (which
+        # takes ~5-15s per worker).  This block re-raises if any env has
+        # hit max_restarts_per_env — that's a hard fail, the trainer's
+        # outer except will save the policy and exit.
+        if failed:
+            alive = [i for i in range(self.n) if i not in failed]
+            self._pause_envs(alive)
+            try:
+                for i in sorted(failed):
+                    if self.env_restart_count[i] >= self.max_restarts_per_env:
+                        raise RuntimeError(
+                            f"env {i} hit max_restarts_per_env="
+                            f"{self.max_restarts_per_env}; aborting run"
+                        )
+                    new_state = self._restart_env(i)
+                    next_states[i] = new_state
+                    drained_lists[i] = []   # any pre-crash drained is now defunct
+                    self.restarted_this_step.append(i)
+            finally:
+                self._resume_envs(alive)
+
         self.states = next_states
         return next_states, drained_lists
+
+    # ------------------------------------------------------------------
+    # Auto-restart support
+    # ------------------------------------------------------------------
+    def _pause_envs(self, indices: list[int]) -> None:
+        """Best-effort pause on a list of env indices (skips dead ones)."""
+        for i in indices:
+            try:
+                self.envs[i].pause()
+            except (OSError, ConnectionError):
+                pass
+
+    def _resume_envs(self, indices: list[int]) -> None:
+        for i in indices:
+            try:
+                self.envs[i].resume()
+            except (OSError, ConnectionError):
+                pass
+
+    def _restart_env(self, i: int) -> StateFrame:
+        """Tear down + relaunch worker ``i`` in place.  Returns the new
+        first STATE.  Raises on relaunch failure (caller handles)."""
+        old = self.dolphins[i]
+
+        # Archive the dead worker's log so the new launch doesn't truncate
+        # it (Dolphin opens log_file with "w").  Indexed suffix so repeat
+        # crashes don't overwrite each other.
+        if old.log_file is not None and old.log_file.exists():
+            try:
+                seq = self.env_restart_count[i] + 1
+                archived = old.log_file.with_name(
+                    f"{old.log_file.stem}.crashed{seq:02d}.log"
+                )
+                old.log_file.rename(archived)
+                print(f"[BatchedEnv] env {i}: archived crash log -> "
+                      f"{archived.name}", flush=True)
+            except OSError as e:
+                print(f"[BatchedEnv] env {i}: log archive failed: {e}",
+                      flush=True)
+
+        # Best-effort teardown.  Don't try to send SHUTDOWN — the socket
+        # is broken (that's why we're here) and Dolphin.close already
+        # handles the resulting OSError, but skip it to avoid extra noise.
+        try:
+            old.close(send_shutdown=False)
+        except Exception as e:
+            print(f"[BatchedEnv] env {i}: old.close raised "
+                  f"{type(e).__name__}: {e}", flush=True)
+
+        print(f"[BatchedEnv] env {i}: relaunching on port {old.ipc_port} "
+              f"(restart #{self.env_restart_count[i] + 1})", flush=True)
+        new = Dolphin(
+            iso_path=old.iso_path,
+            ipc_port=old.ipc_port,
+            dolphin_exe=old.dolphin_exe,
+            headless=True,
+            worker_id=i,
+            savestate_path=old.savestate_path,
+            user_dir=old.user_dir,
+            ai_controlled_port=old.ai_controlled_port,
+            ai_mirror_x=old.ai_mirror_x,
+            connect_timeout_s=old.connect_timeout_s,
+            log_file=old.log_file,
+            log_passthrough=False,
+        )
+        new.start()
+        new.connect()
+        self.dolphins[i] = new
+        self.envs[i] = Env(new.socket)
+        state = self._wait_first_state(i)
+        self.env_restart_count[i] += 1
+        print(f"[BatchedEnv] env {i}: restart complete; "
+              f"frame_id={state.frame_id} "
+              f"(lifetime restarts={self.env_restart_count[i]})", flush=True)
+        return state
 
     # ------------------------------------------------------------------
     # Pause / resume (freeze all games across a PPO update)

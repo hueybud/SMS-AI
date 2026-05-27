@@ -96,6 +96,10 @@ def main() -> int:
                    help="per-worker Dolphin stdout/stderr dir; default "
                         "silences worker output (N>1 passthrough is unreadable)")
     p.add_argument("--first-state-timeout-s", type=float, default=600.0)
+    p.add_argument("--max-env-restarts", type=int, default=5,
+                   help="per-env circuit breaker for auto-restart. If any "
+                        "one env crashes this many times the run aborts. "
+                        "Set 0 to disable auto-restart entirely.")
     # PPO knobs (mirror rl/train.py defaults)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--ppo-epsilon", type=float, default=1e-2)
@@ -202,6 +206,7 @@ def main() -> int:
         base_port=args.base_port,
         log_dir=(Path(args.log_dir) if args.log_dir else None),
         first_state_timeout_s=args.first_state_timeout_s,
+        max_restarts_per_env=args.max_env_restarts,
     )
     try:
         states = benv.start()
@@ -322,6 +327,50 @@ def main() -> int:
                 next_states, drained_lists = benv.step(
                     outs, savestate_picker=savestate_picker
                 )
+
+                # ── Mid-cycle worker restart handling ──
+                # If batch_env had to restart any worker(s) during this
+                # step, those envs are now in a fresh post-savestate state
+                # — their partial trajectories from this cycle are gone.
+                # Lockstep is also broken (buffers are at different fill
+                # levels).  Simplest robust action: discard the whole
+                # cycle, restart collection from this moment.  Wastes ~one
+                # partial cycle per crash; at our crash rate (~1/25min)
+                # that's ~3% overhead, not worth per-env partial-reset
+                # bookkeeping.
+                if benv.restarted_this_step:
+                    print(f"[train-batched] envs {benv.restarted_this_step} "
+                          f"restarted mid-cycle; discarding partial cycle "
+                          f"and restarting collection", flush=True)
+                    for e in benv.restarted_this_step:
+                        agent.reset_env(e)
+                    buffers = [TrajectoryBuffer(length=args.rollout_length)
+                               for _ in range(args.num_envs)]
+                    rcs = [
+                        reward_mod.RewardComputer(
+                            mirror_x,
+                            event_sink=(reward_event_sink if e == 0 else None),
+                        )
+                        for e in range(args.num_envs)
+                    ]
+                    for e, s in enumerate(benv.states):
+                        buffers[e].push_state(s)
+                    per_env_rewards = [[] for _ in range(args.num_envs)]
+                    # Re-snapshot the agent's initial KV/prev_labels at this
+                    # new cycle start.  Crashed envs have zero KV (just
+                    # reset); others retain their evolved state — correct
+                    # for PPO replay since the replay will reproduce the
+                    # actions taken from THIS state forward.
+                    init_kvs = agent.snapshot_kv_per_env()
+                    init_pls = agent.snapshot_prev_labels_per_env()
+                    # Also reset cycle counters that the discarded steps
+                    # contributed to.
+                    cycle_goals_for = 0
+                    cycle_goals_against = 0
+                    cycle_matches_reset = 0
+                    act_times = []
+                    drained_at_start = benv.total_drained
+                    continue
 
                 # Per-env: reward over the chain (prev → drained... → next)
                 # and push the next state into that env's trajectory buffer.
