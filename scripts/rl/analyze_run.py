@@ -148,7 +148,7 @@ def main() -> int:
     print(f"-- Learning curves (by decile of {n} cycles) --")
     if has_goals:
         hdr = (f"  {'cyc':>10s} | {'reward':>7s} {'gf':>4s} {'ga':>4s} "
-               f"{'diff':>5s} | {'evt':>4s} {'kl':>5s} {'|gn|':>5s} "
+               f"{'diff':>5s} {'rst':>4s} | {'evt':>4s} {'kl':>5s} {'|gn|':>5s} "
                f"{'ppo':>6s} {'rho':>5s}")
     else:
         hdr = (f"  {'cyc':>10s} | {'reward':>7s} | {'evt':>4s} {'kl':>5s} "
@@ -172,8 +172,9 @@ def main() -> int:
         if has_goals:
             gf = sum(_num(r, "goals_for", as_int=True) or 0 for r in sub)
             ga = sum(_num(r, "goals_against", as_int=True) or 0 for r in sub)
+            rst = sum(_num(r, "matches_reset", as_int=True) or 0 for r in sub)
             print(f"  {s:>4d}-{e-1:<4d}  | {rs:+7.2f} {gf:>4d} {ga:>4d} "
-                  f"{gf-ga:+5d} | {evts:>4.0f} {kl:>5.2f} {gn:>5.2f} "
+                  f"{gf-ga:+5d} {rst:>4d} | {evts:>4.0f} {kl:>5.2f} {gn:>5.2f} "
                   f"{ppo:>6.3f} {rho:>5.3f}")
         else:
             print(f"  {s:>4d}-{e-1:<4d}  | {rs:+7.2f} | {evts:>4.0f} {kl:>5.2f} "
@@ -207,9 +208,10 @@ def main() -> int:
     if has_goals:
         gf_r = sum_int(recent, "goals_for")
         ga_r = sum_int(recent, "goals_against")
+        rst_r = sum_int(recent, "matches_reset")
         gd_r = (gf_r - ga_r) / L
         print(f"  goals (recent):      {gf_r} for / {ga_r} against / "
-              f"diff {gf_r-ga_r:+d}  ({gd_r:+.2f}/cycle)")
+              f"diff {gf_r-ga_r:+d}  ({gd_r:+.2f}/cycle)  matches_reset={rst_r}")
         if early:
             gf_e = sum_int(early, "goals_for")
             ga_e = sum_int(early, "goals_against")
