@@ -211,7 +211,19 @@ _SELF_DY_OFFSET = 23  # Δpos_y to ball
 # goal signal.  Shots that lead to deeper counters (mid-third recovery,
 # -0.10) still net solidly negative, so this isn't a free pellet — it's a
 # nudge toward "try the shot" when the rebound is shallow.
-SHOT_REWARD = +0.05
+#
+# Bumped 2026-05-27 from +0.05 -> +0.20 after v3 (kl-teacher=3e-2) data
+# showed offensive abandonment: shots/cycle dropped from 2.9 -> 0.0
+# across ~180 cycles while stagnation tripled (85 -> 282 events/cycle).
+# Per-shot EV math at 0.05: ~+0.02 on miss-in-atk vs ~-1.0 risk of
+# counterattack goal -> PPO correctly read "shots are net negative."
+# At 0.20, pro-shot net on miss-in-atk is ~+0.17, large enough to
+# survive being averaged against the counterattack-goal probability
+# while the policy is still learning to convert. If this over-rewards
+# spam-shooting we can dial back, but the v3 evidence is that 0.05 is
+# below the floor where offense survives at all.  THEIR_SHOT_REWARD
+# tracks symmetrically (= -SHOT_REWARD).
+SHOT_REWARD = +0.20
 # Mirror penalty for the opponent entering a shot state on their
 # offensive side (the agent's defensive side, mirrored x < 0).  Without
 # this the reward is asymmetric — we get +SHOT for trying, they get a
