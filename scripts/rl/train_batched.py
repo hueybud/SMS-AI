@@ -258,7 +258,13 @@ def main() -> int:
         # the same frame as match_end (synthetic state is overwritten by
         # reset in BatchedEnvironment.step), but the vast majority of goals
         # happen mid-match and ARE caught.
-        "goals_for", "goals_against", "goal_diff", "matches_reset",
+        # reset_contexts = total chain transitions with reset_context=True
+        # (goal-induced kickoffs + match-end loads).  matches_completed =
+        # actual match-end events (synthetic frames with match_end=True).
+        # reset_contexts is roughly 2*goals + 1*matches; matches_completed
+        # is the cleaner "is the game finishing matches" signal.
+        "goals_for", "goals_against", "goal_diff",
+        "reset_contexts", "matches_completed",
         "adv_mean", "adv_std",
         "loss_total", "loss_ppo", "loss_value", "loss_kl_teacher",
         "loss_entropy", "rho_mean", "log_rho_abs_max", "grad_norm",
@@ -301,7 +307,8 @@ def main() -> int:
             # goals FOR and score_right increases are goals AGAINST.
             cycle_goals_for = 0
             cycle_goals_against = 0
-            cycle_matches_reset = 0
+            cycle_reset_contexts = 0     # any chain b.reset_context=True
+            cycle_matches_completed = 0  # any chain b.match_end=True
 
             # ── Collect one cycle: each buffer fills to rollout_length ───
             # Sync pacing keeps the envs lockstep — they all reach full at
@@ -367,7 +374,8 @@ def main() -> int:
                     # contributed to.
                     cycle_goals_for = 0
                     cycle_goals_against = 0
-                    cycle_matches_reset = 0
+                    cycle_reset_contexts = 0
+                    cycle_matches_completed = 0
                     act_times = []
                     drained_at_start = benv.total_drained
                     continue
@@ -388,7 +396,13 @@ def main() -> int:
                             intended_stick=outs[e]["stick_vals"],
                         )
                         if b.reset_context:
-                            cycle_matches_reset += 1
+                            cycle_reset_contexts += 1
+                        if b.match_end:
+                            # Synthetic match_end frame appears once per
+                            # actual match completion (BatchedEnvironment.step
+                            # appends it to drained_lists before resetting),
+                            # so this counts real matches finished.
+                            cycle_matches_completed += 1
                         # Score deltas: count positive deltas (real goals)
                         # ALWAYS, even across reset_context boundaries — most
                         # goals trigger a phase transition (celebration ->
@@ -478,7 +492,8 @@ def main() -> int:
                 f"[train-batched] cycle={cycle_idx - 1:5d} {update_tag} "
                 f"frames={total_frames:9d} "
                 f"goals={cycle_goals_for}-{cycle_goals_against} "
-                f"(diff={goal_diff:+d}, {cycle_matches_reset} resets) "
+                f"(diff={goal_diff:+d}, {cycle_matches_completed} matches, "
+                f"{cycle_reset_contexts} rsts) "
                 f"reward_sum={reward_sum:+.2f} events={reward_events:3d} "
                 f"adv_mean={float(adv_concat.mean()):+.3f} "
                 f"loss={metrics['loss/total']:+.4f} "
@@ -498,7 +513,7 @@ def main() -> int:
                 f"{t_collect:.3f}", f"{t_update:.3f}", args.num_envs,
                 f"{reward_sum:.4f}", reward_events,
                 cycle_goals_for, cycle_goals_against, goal_diff,
-                cycle_matches_reset,
+                cycle_reset_contexts, cycle_matches_completed,
                 f"{float(adv_concat.mean()):.4f}",
                 f"{float(adv_concat.std()):.4f}",
                 f"{metrics['loss/total']:.4f}",

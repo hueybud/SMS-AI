@@ -89,6 +89,19 @@ def main() -> int:
         return 1
 
     has_goals = "goals_for" in rows[0]
+    # Column-name compat: pre-2026-05-27 runs called this "matches_reset"
+    # (a misnomer -- it counts ANY reset_context, including goal-induced
+    # kickoffs, not just match completions).  New runs split the two:
+    # reset_contexts (every chain b.reset_context=True) and matches_completed
+    # (every chain b.match_end=True, the cleaner "is the game finishing
+    # matches" signal).  Read whichever the CSV has.
+    if "reset_contexts" in rows[0]:
+        RESET_COL = "reset_contexts"
+    elif "matches_reset" in rows[0]:
+        RESET_COL = "matches_reset"
+    else:
+        RESET_COL = None
+    has_matches_completed = "matches_completed" in rows[0]
 
     # ── Header ───────────────────────────────────────────────────────────
     sep = "=" * 78
@@ -147,9 +160,14 @@ def main() -> int:
     # ── Decile curves ────────────────────────────────────────────────────
     print(f"-- Learning curves (by decile of {n} cycles) --")
     if has_goals:
+        # `mch` (matches_completed) is the cleaner game-progress signal --
+        # it's actual match completions, not the misleading total of
+        # reset_contexts.  Show it next to `rst` so both are visible
+        # when both columns exist; older legacy runs show only rst.
+        mch_col = f" {'mch':>4s}" if has_matches_completed else ""
         hdr = (f"  {'cyc':>10s} | {'reward':>7s} {'gf':>4s} {'ga':>4s} "
-               f"{'diff':>5s} {'rst':>4s} | {'evt':>4s} {'kl':>5s} {'|gn|':>5s} "
-               f"{'ppo':>6s} {'rho':>5s}")
+               f"{'diff':>5s} {'rst':>4s}{mch_col} | {'evt':>4s} {'kl':>5s} "
+               f"{'|gn|':>5s} {'ppo':>6s} {'rho':>5s}")
     else:
         hdr = (f"  {'cyc':>10s} | {'reward':>7s} | {'evt':>4s} {'kl':>5s} "
                f"{'|gn|':>5s} {'ppo':>6s} {'rho':>5s}")
@@ -172,10 +190,16 @@ def main() -> int:
         if has_goals:
             gf = sum(_num(r, "goals_for", as_int=True) or 0 for r in sub)
             ga = sum(_num(r, "goals_against", as_int=True) or 0 for r in sub)
-            rst = sum(_num(r, "matches_reset", as_int=True) or 0 for r in sub)
+            rst = sum(_num(r, RESET_COL, as_int=True) or 0 for r in sub) \
+                  if RESET_COL else 0
+            mch_str = ""
+            if has_matches_completed:
+                mch = sum(_num(r, "matches_completed", as_int=True) or 0
+                          for r in sub)
+                mch_str = f" {mch:>4d}"
             print(f"  {s:>4d}-{e-1:<4d}  | {rs:+7.2f} {gf:>4d} {ga:>4d} "
-                  f"{gf-ga:+5d} {rst:>4d} | {evts:>4.0f} {kl:>5.2f} {gn:>5.2f} "
-                  f"{ppo:>6.3f} {rho:>5.3f}")
+                  f"{gf-ga:+5d} {rst:>4d}{mch_str} | {evts:>4.0f} "
+                  f"{kl:>5.2f} {gn:>5.2f} {ppo:>6.3f} {rho:>5.3f}")
         else:
             print(f"  {s:>4d}-{e-1:<4d}  | {rs:+7.2f} | {evts:>4.0f} {kl:>5.2f} "
                   f"{gn:>5.2f} {ppo:>6.3f} {rho:>5.3f}")
@@ -208,10 +232,17 @@ def main() -> int:
     if has_goals:
         gf_r = sum_int(recent, "goals_for")
         ga_r = sum_int(recent, "goals_against")
-        rst_r = sum_int(recent, "matches_reset")
+        rst_r = sum_int(recent, RESET_COL) if RESET_COL else 0
         gd_r = (gf_r - ga_r) / L
-        print(f"  goals (recent):      {gf_r} for / {ga_r} against / "
-              f"diff {gf_r-ga_r:+d}  ({gd_r:+.2f}/cycle)  matches_reset={rst_r}")
+        if has_matches_completed:
+            mch_r = sum_int(recent, "matches_completed")
+            print(f"  goals (recent):      {gf_r} for / {ga_r} against / "
+                  f"diff {gf_r-ga_r:+d}  ({gd_r:+.2f}/cycle)  "
+                  f"matches_completed={mch_r}  reset_contexts={rst_r}")
+        else:
+            print(f"  goals (recent):      {gf_r} for / {ga_r} against / "
+                  f"diff {gf_r-ga_r:+d}  ({gd_r:+.2f}/cycle)  "
+                  f"{RESET_COL or 'resets'}={rst_r}")
         if early:
             gf_e = sum_int(early, "goals_for")
             ga_e = sum_int(early, "goals_against")
@@ -297,11 +328,19 @@ def main() -> int:
     # verdicts in this case: their math is meaningless when recent is
     # all degenerate zeros.
     recent_events_mean = m(recent, "reward_events")
-    recent_resets_total = sum_int(recent, "matches_reset") if has_goals else None
+    # Cleanest "is the game progressing?" signal is matches_completed
+    # (real match-end events) when available; fall back to the legacy
+    # column name otherwise. Both should hit zero on a wedged emulator.
+    if has_matches_completed:
+        recent_progress_total = sum_int(recent, "matches_completed")
+    elif RESET_COL:
+        recent_progress_total = sum_int(recent, RESET_COL)
+    else:
+        recent_progress_total = None
     stuck = (
         len(recent) >= 20
         and recent_events_mean < 1.0
-        and (recent_resets_total == 0 if has_goals else True)
+        and (recent_progress_total == 0 if recent_progress_total is not None else True)
     )
     if stuck:
         warn.append(
