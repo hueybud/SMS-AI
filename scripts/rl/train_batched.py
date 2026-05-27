@@ -340,8 +340,13 @@ def main() -> int:
                         )
                         if b.reset_context:
                             cycle_matches_reset += 1
-                            continue
-                        # AI side = LEFT when mirror_x=False, RIGHT when True.
+                        # Score deltas: count positive deltas (real goals)
+                        # ALWAYS, even across reset_context boundaries — most
+                        # goals trigger a phase transition (celebration ->
+                        # kickoff) and the kickoff frame carries reset_context
+                        # AND the just-incremented score.  Negative deltas
+                        # happen on savestate reloads (score 3 -> 0) and must
+                        # be ignored; clipping to >0 handles both cleanly.
                         if mirror_x:
                             f_delta = b.score_right - a.score_right
                             a_delta = b.score_left  - a.score_left

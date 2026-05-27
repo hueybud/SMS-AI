@@ -242,6 +242,12 @@ class BatchedEnvironment:
         for i, s in enumerate(next_states):
             if s.match_end:
                 sid = savestate_picker(i) if savestate_picker else 0
+                # Preserve the match-end terminal state in this env's chain
+                # before reset() overwrites it. Without this, a goal that
+                # also ended the match (mercy rule, buzzer-beater) would be
+                # invisible: the synthetic match_end frame carries the final
+                # score, and the post-reset frame carries 0-0.
+                drained_lists[i].append(s)
                 next_states[i] = self.envs[i].reset(sid)
         self.states = next_states
         return next_states, drained_lists
