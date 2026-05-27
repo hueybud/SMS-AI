@@ -274,6 +274,14 @@ class Dolphin:
             "AIControlledPort": str(self.ai_controlled_port),
             "AIMirrorX": "True" if self.ai_mirror_x else "False",
             "AIPanicAlerts": "False",  # suppress panic dialogs (headless = no GUI to ack)
+            # Synchronous pacing: OnFrameEnd blocks until Python returns an
+            # action echoing the submitted frame_id (200ms watchdog).  Pins
+            # the emulator's frame cadence to the trainer's response rate,
+            # which is what makes N parallel headless workers actually scale
+            # — without it the emulators free-run, starve the trainer of
+            # CPU, and discard ~2/3 of frames (see rl/bench_act.py).  Off
+            # by default in C++ to keep windowed BC play unchanged.
+            "AISynchronous": "True",
             # UseNullBackend is a Citrus hack that forces Null GFXBackend +
             # unlimited speed during DTM playback (BootManager.cpp:78,
             # MovieConfigLoader.cpp:35).  Our RL flow boots savestates, not
