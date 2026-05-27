@@ -108,6 +108,16 @@ class BatchedEnvironment:
         # the in-progress rollout cycle (per-env trajectory partial data is
         # not salvageable once that env reset to a fresh savestate).
         self.restarted_this_step: list[int] = []
+        # Stagnation detection: Dolphin can wedge after a savestate load
+        # (game CPU thread stalls but VI hooks keep firing, so the IPC
+        # still responds with the same frame_id forever — symptom is
+        # FPS=0 / VPS>0 in the worker's OSD log).  The socket is alive
+        # so our normal auto-restart doesn't catch it.  Detect by
+        # counting consecutive steps where frame_id doesn't advance
+        # without a reset_context; force-restart once the count exceeds
+        # the threshold (~2.5s wall-clock at sync-paced step rates).
+        self.no_progress_steps: list[int] = [0] * num_envs
+        self.no_progress_threshold: int = 100
 
         self.dolphins: list[Dolphin] = [
             Dolphin(
@@ -311,7 +321,30 @@ class BatchedEnvironment:
                       f"{type(e).__name__}: {e}", flush=True)
                 failed.add(i)
 
-        # 4. Restart any envs that failed.  Pause the alive envs first so
+        # 4. Stagnation detection: a Dolphin can wedge post-savestate-load
+        # (CPU thread stalled, VI hooks still firing).  The socket is alive
+        # so the failures in steps 1-3 don't catch it, but frame_id stops
+        # advancing.  Force-restart envs that haven't moved for too many
+        # consecutive steps without a reset_context.  Skip envs already
+        # marked failed above — they're getting restarted anyway.
+        for i in range(self.n):
+            if i in failed:
+                self.no_progress_steps[i] = 0
+                continue
+            new = next_states[i]
+            if not new.reset_context and new.frame_id == self.states[i].frame_id:
+                self.no_progress_steps[i] += 1
+                if self.no_progress_steps[i] >= self.no_progress_threshold:
+                    print(f"[BatchedEnv] env {i}: STAGNATION "
+                          f"({self.no_progress_steps[i]} steps stuck at "
+                          f"frame_id={new.frame_id}); forcing restart",
+                          flush=True)
+                    failed.add(i)
+                    self.no_progress_steps[i] = 0
+            else:
+                self.no_progress_steps[i] = 0
+
+        # 5. Restart any envs that failed.  Pause the alive envs first so
         # they don't free-run + pile up backlog while we relaunch (which
         # takes ~5-15s per worker).  This block re-raises if any env has
         # hit max_restarts_per_env — that's a hard fail, the trainer's

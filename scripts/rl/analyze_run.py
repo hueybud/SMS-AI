@@ -252,6 +252,10 @@ def main() -> int:
     if recent_kl > KL_RECENT_HIGH:
         warn.append(f"KL teacher elevated in recent window: {recent_kl:.2f} "
                     f"(consider raising --kl-teacher next run)")
+    elif kl_peak > KL_PEAK_WARN and recent_kl == 0.0:
+        # Frozen, not settled.  STUCK warning (if present) covers root cause.
+        warn.append(f"KL teacher peaked at {kl_peak:.2f} then dropped to 0.00 -- "
+                    f"policy frozen (no updates firing), NOT converged")
     elif kl_peak > KL_PEAK_WARN:
         warn.append(f"KL teacher had a peak of {kl_peak:.2f} -- excursion happened; "
                     f"OK if recent has settled (it's at {recent_kl:.2f})")
@@ -261,6 +265,9 @@ def main() -> int:
     recent_gn = m(recent, "grad_norm")
     if recent_gn > GN_RECENT_HIGH:
         warn.append(f"grad_norm elevated recently: {recent_gn:.2f} -- large updates")
+    elif recent_gn == 0.0 and stuck:
+        # Don't report 0.0 as "in band" when the policy is frozen.
+        pass
     else:
         good.append(f"grad_norm in band (recent {recent_gn:.2f})")
 
@@ -283,6 +290,27 @@ def main() -> int:
         warn.append(f"FAIL/ERROR markers in training.log "
                     f"(FAIL={fails} ERROR={errors})")
 
+    # Detect "stuck emulator": recent window has ~zero events AND zero
+    # matches completing.  This is the FPS=0 wedged-Dolphin pattern --
+    # socket alive, IPC responding, but the game CPU thread is frozen
+    # post-savestate-load.  Override the goal_diff / KL "trending up"
+    # verdicts in this case: their math is meaningless when recent is
+    # all degenerate zeros.
+    recent_events_mean = m(recent, "reward_events")
+    recent_resets_total = sum_int(recent, "matches_reset") if has_goals else None
+    stuck = (
+        len(recent) >= 20
+        and recent_events_mean < 1.0
+        and (recent_resets_total == 0 if has_goals else True)
+    )
+    if stuck:
+        warn.append(
+            f"STUCK: recent {L} cycles produced ~0 reward events"
+            + (f" and 0 matches completed" if has_goals else "")
+            + ". Emulator likely wedged (FPS=0 with live socket). batch_env "
+            "now has frame_id-stagnation auto-restart -- check that you're "
+            "on a build with it, and inspect *.crashed*.log archives."
+        )
     if has_goals and early:
         gf_r = sum_int(recent, "goals_for")
         ga_r = sum_int(recent, "goals_against")
@@ -290,14 +318,16 @@ def main() -> int:
         ga_e = sum_int(early, "goals_against")
         gd_r = (gf_r - ga_r) / L
         gd_e = (gf_e - ga_e) / L
-        if gd_r - gd_e > GOAL_DIFF_DELTA:
-            good.append(f"goal_diff trending UP: {gd_e:+.2f} → {gd_r:+.2f}/cycle")
+        if stuck:
+            pass   # don't celebrate "trending up" when recent is degenerate
+        elif gd_r - gd_e > GOAL_DIFF_DELTA:
+            good.append(f"goal_diff trending UP: {gd_e:+.2f} -> {gd_r:+.2f}/cycle")
         elif gd_r - gd_e < -GOAL_DIFF_DELTA:
-            warn.append(f"goal_diff trending DOWN: {gd_e:+.2f} → {gd_r:+.2f}/cycle "
+            warn.append(f"goal_diff trending DOWN: {gd_e:+.2f} -> {gd_r:+.2f}/cycle "
                         f"(policy may be regressing)")
         else:
-            good.append(f"goal_diff roughly stable: {gd_e:+.2f} → {gd_r:+.2f}/cycle")
-    elif has_goals:
+            good.append(f"goal_diff roughly stable: {gd_e:+.2f} -> {gd_r:+.2f}/cycle")
+    elif has_goals and not stuck:
         gf_r = sum_int(recent, "goals_for")
         ga_r = sum_int(recent, "goals_against")
         good.append(f"goal_diff (recent only): {(gf_r-ga_r)/L:+.2f}/cycle")
