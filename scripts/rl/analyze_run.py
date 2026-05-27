@@ -102,6 +102,8 @@ def main() -> int:
     else:
         RESET_COL = None
     has_matches_completed = "matches_completed" in rows[0]
+    # Behavior columns added 2026-05-27; older runs won't have them.
+    has_behavior = "shots_for" in rows[0]
 
     # ── Header ───────────────────────────────────────────────────────────
     sep = "=" * 78
@@ -205,6 +207,34 @@ def main() -> int:
                   f"{gn:>5.2f} {ppo:>6.3f} {rho:>5.3f}")
     print()
 
+    # ── Behavioral decile table ──────────────────────────────────────────
+    # Counts (per decile, summed across all envs) of named events emitted
+    # by reward.RewardComputer.  Lets you see how the policy's PLAY is
+    # changing -- shots taken, possession gained/lost, stagnation -- not
+    # just whether it wins more.  Particularly useful for comparing runs
+    # with different hyperparameters (e.g. did a tighter --kl-teacher
+    # increase shot frequency?).
+    if has_behavior:
+        print("-- Behavior (by decile, totals across all envs) --")
+        bhdr = (f"  {'cyc':>10s} | {'shots':>6s} {'thr_sh':>6s} | "
+                f"{'gains':>6s} {'losses':>6s} | {'stag':>6s}")
+        print(bhdr)
+        print(f"  {'-' * (len(bhdr) - 2)}")
+        for b in range(n_bins):
+            s = b * n // n_bins
+            e = (b + 1) * n // n_bins
+            sub = rows[s:e]
+            if not sub:
+                continue
+            sf = sum(_num(r, "shots_for",     as_int=True) or 0 for r in sub)
+            sa = sum(_num(r, "shots_against", as_int=True) or 0 for r in sub)
+            gn_ = sum(_num(r, "gains",        as_int=True) or 0 for r in sub)
+            ls = sum(_num(r, "losses",        as_int=True) or 0 for r in sub)
+            st = sum(_num(r, "stag_events",   as_int=True) or 0 for r in sub)
+            print(f"  {s:>4d}-{e-1:<4d}  | {sf:>6d} {sa:>6d} | "
+                  f"{gn_:>6d} {ls:>6d} | {st:>6d}")
+        print()
+
     # ── Recent window vs early window ────────────────────────────────────
     L = min(args.last_n, n)
     recent = rows[-L:]
@@ -265,6 +295,22 @@ def main() -> int:
          m(early, "update_s") if early else None, fmt="{:.1f}s")
     show("act_avg_ms mean:",   m(recent, "act_avg_ms"),
          m(early, "act_avg_ms") if early else None, fmt="{:.1f}ms")
+
+    if has_behavior:
+        # Per-cycle behavioral rates -- divide totals by L so it's easy
+        # to compare across runs of different length (events/cycle).
+        def behav(window, key):
+            return sum_int(window, key) / max(len(window), 1)
+        show("shots_for/cycle:",     behav(recent, "shots_for"),
+             behav(early, "shots_for") if early else None, fmt="{:.2f}")
+        show("shots_against/cycle:", behav(recent, "shots_against"),
+             behav(early, "shots_against") if early else None, fmt="{:.2f}")
+        show("gains/cycle:",         behav(recent, "gains"),
+             behav(early, "gains") if early else None, fmt="{:.2f}")
+        show("losses/cycle:",        behav(recent, "losses"),
+             behav(early, "losses") if early else None, fmt="{:.2f}")
+        show("stag_events/cycle:",   behav(recent, "stag_events"),
+             behav(early, "stag_events") if early else None, fmt="{:.2f}")
     print()
 
     # ── Verdict ──────────────────────────────────────────────────────────

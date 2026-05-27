@@ -179,6 +179,32 @@ def main() -> int:
             except OSError:
                 pass
 
+    # ── Per-cycle behavioral event counter ───────────────────────────────
+    # reward.RewardComputer emits named events (SHOT, GAIN_ATK_THIRD,
+    # STAGNATION, …) every time something interesting happens in-game.
+    # We tally counts of every event across all N envs each cycle so we
+    # can answer "is the policy shooting more / turning the ball over
+    # less / camping less?" across runs, not just "is reward going up".
+    # The Counter is created ONCE and cleared in-place each cycle so the
+    # closures below keep referring to the same object.
+    from collections import Counter as _Counter
+
+    event_counts: "_Counter[str]" = _Counter()
+
+    def make_env_sink(env_idx: int):
+        """Per-env event sink: always tallies into the shared
+        event_counts, additionally forwards to the reward overlay for
+        env 0 (the overlay is single-env; aggregating across envs would
+        be misleading in its UI)."""
+        overlay = reward_event_sink if env_idx == 0 else None
+
+        def sink(name: str, value: float) -> None:
+            event_counts[name] += 1
+            if overlay is not None:
+                overlay(name, value)
+
+        return sink
+
     # ── Learner + batched agent ──────────────────────────────────────────
     config = PPOConfig(
         epsilon=args.ppo_epsilon,
@@ -225,10 +251,7 @@ def main() -> int:
     buffers = [TrajectoryBuffer(length=args.rollout_length)
                for _ in range(args.num_envs)]
     rcs = [
-        reward_mod.RewardComputer(
-            mirror_x,
-            event_sink=(reward_event_sink if i == 0 else None),
-        )
+        reward_mod.RewardComputer(mirror_x, event_sink=make_env_sink(i))
         for i in range(args.num_envs)
     ]
     for b, s in zip(buffers, states):
@@ -265,6 +288,11 @@ def main() -> int:
         # is the cleaner "is the game finishing matches" signal.
         "goals_for", "goals_against", "goal_diff",
         "reset_contexts", "matches_completed",
+        # Behavioral tally (see make_env_sink): per-cycle totals across
+        # all N envs of named events emitted by reward.RewardComputer.
+        # Lets us compare runs by what the policy is DOING, not just what
+        # it scores: shots taken/given, ball gains/losses, stagnation.
+        "shots_for", "shots_against", "gains", "losses", "stag_events",
         "adv_mean", "adv_std",
         "loss_total", "loss_ppo", "loss_value", "loss_kl_teacher",
         "loss_entropy", "rho_mean", "log_rho_abs_max", "grad_norm",
@@ -309,6 +337,7 @@ def main() -> int:
             cycle_goals_against = 0
             cycle_reset_contexts = 0     # any chain b.reset_context=True
             cycle_matches_completed = 0  # any chain b.match_end=True
+            event_counts.clear()         # behavioral tally (see make_env_sink)
 
             # ── Collect one cycle: each buffer fills to rollout_length ───
             # Sync pacing keeps the envs lockstep — they all reach full at
@@ -354,10 +383,7 @@ def main() -> int:
                     buffers = [TrajectoryBuffer(length=args.rollout_length)
                                for _ in range(args.num_envs)]
                     rcs = [
-                        reward_mod.RewardComputer(
-                            mirror_x,
-                            event_sink=(reward_event_sink if e == 0 else None),
-                        )
+                        reward_mod.RewardComputer(mirror_x, event_sink=make_env_sink(e))
                         for e in range(args.num_envs)
                     ]
                     for e, s in enumerate(benv.states):
@@ -376,6 +402,7 @@ def main() -> int:
                     cycle_goals_against = 0
                     cycle_reset_contexts = 0
                     cycle_matches_completed = 0
+                    event_counts.clear()
                     act_times = []
                     drained_at_start = benv.total_drained
                     continue
@@ -488,21 +515,33 @@ def main() -> int:
                 batch_trajs = []
 
             goal_diff = cycle_goals_for - cycle_goals_against
+            # Roll up event_counts into behavioral aggregates.  All counts
+            # are summed across the 16 envs for this cycle.
+            shots_for      = event_counts.get("SHOT", 0)
+            shots_against  = event_counts.get("THEIR_SHOT", 0)
+            gains = (event_counts.get("GAIN_DEF_THIRD", 0)
+                     + event_counts.get("GAIN_MID_THIRD", 0)
+                     + event_counts.get("GAIN_ATK_THIRD", 0)
+                     + event_counts.get("GAIN_GOALIE", 0))
+            losses = (event_counts.get("LOSS_DEF_THIRD", 0)
+                      + event_counts.get("LOSS_MID_THIRD", 0)
+                      + event_counts.get("LOSS_ATK_THIRD", 0))
+            stag_events = (event_counts.get("STAGNATION", 0)
+                           + event_counts.get("BACKWARD_FREE", 0)
+                           + event_counts.get("WALL_CAMP", 0))
             line = (
                 f"[train-batched] cycle={cycle_idx - 1:5d} {update_tag} "
                 f"frames={total_frames:9d} "
                 f"goals={cycle_goals_for}-{cycle_goals_against} "
                 f"(diff={goal_diff:+d}, {cycle_matches_completed} matches, "
                 f"{cycle_reset_contexts} rsts) "
+                f"shots={shots_for}/{shots_against} "
+                f"g/l={gains}/{losses} stag={stag_events} "
                 f"reward_sum={reward_sum:+.2f} events={reward_events:3d} "
-                f"adv_mean={float(adv_concat.mean()):+.3f} "
                 f"loss={metrics['loss/total']:+.4f} "
-                f"ppo={metrics['loss/ppo_obj']:+.4f} "
-                f"value={metrics['loss/value']:.4f} "
                 f"kl={metrics['loss/kl_teacher']:.4f} "
                 f"|gn|={metrics['grad_norm']:.3f} "
-                f"|t| collect={t_collect:.1f}s update={t_update:.1f}s "
-                f"act_avg={act_avg * 1000:.1f}ms drained={drained_this_cycle}"
+                f"|t| collect={t_collect:.1f}s update={t_update:.1f}s"
             )
             print(line, flush=True)
             log_f.write(line + "\n")
@@ -514,6 +553,7 @@ def main() -> int:
                 f"{reward_sum:.4f}", reward_events,
                 cycle_goals_for, cycle_goals_against, goal_diff,
                 cycle_reset_contexts, cycle_matches_completed,
+                shots_for, shots_against, gains, losses, stag_events,
                 f"{float(adv_concat.mean()):.4f}",
                 f"{float(adv_concat.std()):.4f}",
                 f"{metrics['loss/total']:.4f}",
