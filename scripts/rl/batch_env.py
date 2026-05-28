@@ -473,11 +473,21 @@ class BatchedEnvironment:
                 print(f"[BatchedEnv] env {i}: log archive failed: {e}",
                       flush=True)
 
-        # Best-effort teardown.  Don't try to send SHUTDOWN — the socket
-        # is broken (that's why we're here) and Dolphin.close already
-        # handles the resulting OSError, but skip it to avoid extra noise.
+        # Best-effort teardown.  Two parameters worth thinking about:
+        # * send_shutdown=True: cheap signal to the worker threads to
+        #   set m_stop and exit promptly; safe on a broken socket too
+        #   (close() catches the OSError).  Helps clean thread join
+        #   for both healthy (match-end) and broken (crash) cases.
+        # * wait_s=1.0: AIController's SHUTDOWN handler only stops the
+        #   IpcBackend threads -- the Dolphin process never exits on
+        #   its own.  We always have to kill().  10s of waiting before
+        #   kill is pure waste; 1s is plenty for any graceful behavior
+        #   that exists today.  At 16 sequential teardowns per
+        #   match-end wave, this cuts the per-wave overhead from ~160s
+        #   to ~16s.  Proper fix is a C++ change to actually call
+        #   Core::Stop on SHUTDOWN; until then this caps the loss.
         try:
-            old.close(send_shutdown=False)
+            old.close(send_shutdown=True, wait_s=1.0)
         except Exception as e:
             print(f"[BatchedEnv] env {i}: old.close raised "
                   f"{type(e).__name__}: {e}", flush=True)
