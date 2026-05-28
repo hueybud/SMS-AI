@@ -87,6 +87,7 @@ class BatchedEnvironment:
         connect_timeout_s: float = 60.0,
         first_state_timeout_s: float = 600.0,
         max_restarts_per_env: int = 5,
+        savestate_paths: Optional[list[str]] = None,
     ):
         if num_envs <= 0:
             raise ValueError(f"num_envs must be > 0, got {num_envs}")
@@ -96,6 +97,17 @@ class BatchedEnvironment:
         self.log_dir = Path(log_dir) if log_dir else None
         if self.log_dir is not None:
             self.log_dir.mkdir(parents=True, exist_ok=True)
+        # Savestate rotation pool for match-end restarts.  Each match-end
+        # event tears the worker's Dolphin down and relaunches a fresh
+        # one with a (possibly different) savestate from this list --
+        # instead of calling State::LoadAs on the running instance,
+        # which has a non-zero rate of wedging the JIT post-load (see
+        # dolphin_wedge_post_savestate memory).  All initial workers
+        # boot from ``savestate_path`` (the canonical entry); the pool
+        # only matters after the first match ends per env.
+        self.savestate_paths: list[str] = (
+            list(savestate_paths) if savestate_paths else [savestate_path]
+        )
         # Auto-restart: when a worker's socket dies (send/recv/reset error
         # mid-step), tear it down and relaunch in place. ``max_restarts_per_env``
         # is the circuit breaker — if one env hits this many crashes, something
@@ -309,9 +321,15 @@ class BatchedEnvironment:
                       f"{type(e).__name__}: {e}", flush=True)
                 failed.add(i)
 
-        # 3. Match-end resets (skip envs we've already failed on).  These can
-        # also fail (TimeoutError if the savestate doesn't produce
-        # reset_context within 240 frames).
+        # 3. Match-end handling.  We DON'T call env.reset() (which would
+        # send IPC RESET and trigger Dolphin's in-process State::LoadAs
+        # path).  That path has a non-trivial probability of wedging the
+        # JIT post-load (FPS=0 / VPS>0 mode) -- see
+        # dolphin_wedge_post_savestate.  Instead we route match-end
+        # through the existing restart pass: tear down the Dolphin,
+        # relaunch fresh with `-s <savestate>`, which is the same
+        # well-tested boot path we use at startup.
+        match_end_savestates: dict[int, int] = {}
         for i in range(self.n):
             if i in failed:
                 continue
@@ -319,18 +337,12 @@ class BatchedEnvironment:
             if not s.match_end:
                 continue
             sid = savestate_picker(i) if savestate_picker else 0
-            # Preserve the match-end terminal state in this env's chain
-            # before reset() overwrites it.  Without this, a goal that
-            # also ended the match (mercy rule, buzzer-beater) would be
-            # invisible: the synthetic match_end frame carries the final
-            # score, and the post-reset frame carries 0-0.
+            # Preserve the match-end terminal state in the chain so
+            # whatever-goal-ended-the-match isn't lost (its score field
+            # carries the final tally).
             drained_lists[i].append(s)
-            try:
-                next_states[i] = self.envs[i].reset(sid)
-            except (OSError, ConnectionError, TimeoutError) as e:
-                print(f"[BatchedEnv] env {i}: match-end reset failed: "
-                      f"{type(e).__name__}: {e}", flush=True)
-                failed.add(i)
+            failed.add(i)
+            match_end_savestates[i] = sid
 
         # 4. Stagnation detection — see __init__ for the two wedge modes
         # this catches.  We check BOTH frame_id repeats (mode a, full CPU
@@ -370,11 +382,16 @@ class BatchedEnvironment:
                 self.no_progress_steps[i] = 0
                 self.last_core_features[i] = new.core_features
 
-        # 5. Restart any envs that failed.  Pause the alive envs first so
-        # they don't free-run + pile up backlog while we relaunch (which
-        # takes ~5-15s per worker).  This block re-raises if any env has
-        # hit max_restarts_per_env — that's a hard fail, the trainer's
-        # outer except will save the policy and exit.
+        # 5. Restart any envs that failed (socket crash, stagnation, OR
+        # match-end -- all routed through here now so there's exactly
+        # one teardown+relaunch path).  Pause the alive envs first so
+        # they don't free-run + pile up backlog while we relaunch
+        # (~5-15s per worker).  Re-raises if any env has hit
+        # max_restarts_per_env -- that's a hard fail, the trainer's
+        # outer except will save the policy and exit.  For match-end
+        # restarts, drained_lists already has the terminal state
+        # appended above; we DON'T blank it out (only blank pre-crash
+        # drained data for socket/stagnation failures).
         if failed:
             alive = [i for i in range(self.n) if i not in failed]
             self._pause_envs(alive)
@@ -385,9 +402,14 @@ class BatchedEnvironment:
                             f"env {i} hit max_restarts_per_env="
                             f"{self.max_restarts_per_env}; aborting run"
                         )
-                    new_state = self._restart_env(i)
+                    sid = match_end_savestates.get(i)
+                    new_state = self._restart_env(i, savestate_id=sid)
                     next_states[i] = new_state
-                    drained_lists[i] = []   # any pre-crash drained is now defunct
+                    if i not in match_end_savestates:
+                        # Crash/stagnation: drained data is from before the
+                        # failure and is no longer meaningful.  Match-end:
+                        # keep drained (we just appended the terminal state).
+                        drained_lists[i] = []
                     self.restarted_this_step.append(i)
             finally:
                 self._resume_envs(alive)
@@ -413,10 +435,27 @@ class BatchedEnvironment:
             except (OSError, ConnectionError):
                 pass
 
-    def _restart_env(self, i: int) -> StateFrame:
+    def _restart_env(
+        self,
+        i: int,
+        savestate_id: Optional[int] = None,
+    ) -> StateFrame:
         """Tear down + relaunch worker ``i`` in place.  Returns the new
-        first STATE.  Raises on relaunch failure (caller handles)."""
+        first STATE.  Raises on relaunch failure (caller handles).
+
+        ``savestate_id`` selects a path from ``self.savestate_paths`` for
+        the new Dolphin to boot into; if None, reuses the worker's
+        current ``savestate_path`` (the right behavior for crash /
+        stagnation restarts).  Match-end restarts pass a picker-chosen
+        id so stadium diversity is preserved across matches.
+        """
         old = self.dolphins[i]
+        if savestate_id is not None and self.savestate_paths:
+            savestate_path = self.savestate_paths[
+                savestate_id % len(self.savestate_paths)
+            ]
+        else:
+            savestate_path = old.savestate_path
 
         # Archive the dead worker's log so the new launch doesn't truncate
         # it (Dolphin opens log_file with "w").  Indexed suffix so repeat
@@ -444,6 +483,7 @@ class BatchedEnvironment:
                   f"{type(e).__name__}: {e}", flush=True)
 
         print(f"[BatchedEnv] env {i}: relaunching on port {old.ipc_port} "
+              f"savestate={Path(savestate_path).name} "
               f"(restart #{self.env_restart_count[i] + 1})", flush=True)
         new = Dolphin(
             iso_path=old.iso_path,
@@ -451,7 +491,7 @@ class BatchedEnvironment:
             dolphin_exe=old.dolphin_exe,
             headless=True,
             worker_id=i,
-            savestate_path=old.savestate_path,
+            savestate_path=savestate_path,
             user_dir=old.user_dir,
             ai_controlled_port=old.ai_controlled_port,
             ai_mirror_x=old.ai_mirror_x,

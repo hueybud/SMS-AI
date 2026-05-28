@@ -223,11 +223,28 @@ def main() -> int:
         device=device, num_envs=args.num_envs,
     )
 
+    # Savestate rotation pool for match-end restarts.  We now route
+    # match-end through the same teardown+relaunch path as crashes
+    # (which avoids the dolphin_wedge_post_savestate failure mode), so
+    # the C++-side kSavestateFiles rotation in Movie.cpp::InitAIControllerIpc
+    # is no longer reached.  Replicate the same three stadium files on the
+    # Python side: if rl_palace.sav / rl_underground.sav / rl_battle_dome.sav
+    # all sit next to --savestate-path, use them; otherwise fall back to
+    # just --savestate-path (no rotation).
+    _save_dir = Path(args.savestate_path).parent
+    _stadium_names = ["rl_palace.sav", "rl_underground.sav", "rl_battle_dome.sav"]
+    _candidates = [str(_save_dir / n) for n in _stadium_names
+                   if (_save_dir / n).exists()]
+    savestate_paths = _candidates if _candidates else [args.savestate_path]
+    print(f"[train-batched] savestate rotation pool: "
+          f"{[Path(p).name for p in savestate_paths]}")
+
     # ── BatchedEnvironment ───────────────────────────────────────────────
     benv = BatchedEnvironment(
         num_envs=args.num_envs,
         iso_path=args.iso,
         savestate_path=args.savestate_path,
+        savestate_paths=savestate_paths,
         exe=args.exe,
         base_port=args.base_port,
         log_dir=(Path(args.log_dir) if args.log_dir else None),
@@ -259,7 +276,9 @@ def main() -> int:
 
     # Match-end resets pick a random stadium for diversity (mirrors single-env).
     def savestate_picker(_env_idx: int) -> int:
-        return random.randrange(NUM_SAVESTATES)
+        # Pool size is determined dynamically by which rl_*.sav files
+        # exist next to --savestate-path (see savestate_paths block above).
+        return random.randrange(len(savestate_paths))
 
     # ── Logging ──────────────────────────────────────────────────────────
     log_path = run_dir / "training.log"
